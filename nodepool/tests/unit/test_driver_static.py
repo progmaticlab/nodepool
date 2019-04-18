@@ -375,6 +375,16 @@ class TestDriverStatic(tests.DBTestCase):
         self.assertEqual(len(req.nodes), 1)
         self.assertNotEqual(req.nodes[0], nodes[0].id)
 
+    def test_host_key_checking_toggle(self):
+        """Test that host key checking can be disabled"""
+        configfile = self.setup_config('static-no-check.yaml')
+        with mock.patch("nodepool.nodeutils.nodescan") as nodescan_mock:
+            pool = self.useNodepool(configfile, watermark_sleep=1)
+            pool.start()
+            nodes = self.waitForNodes('fake-label')
+            self.assertEqual(len(nodes), 1)
+            nodescan_mock.assert_not_called()
+
     def test_missing_static_node(self):
         """Test that a missing static node is added"""
         configfile = self.setup_config('static-2-nodes.yaml')

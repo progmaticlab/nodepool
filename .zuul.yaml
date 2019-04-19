@@ -8,10 +8,10 @@
     pre-run: playbooks/nodepool-zuul-functional/pre.yaml
     post-run: playbooks/nodepool-zuul-functional/post.yaml
     required-projects:
-      - openstack-infra/nodepool
-      - openstack-infra/zuul
+      - zuul/nodepool
+      - zuul/zuul
     vars:
-      zuul_work_dir: "{{ zuul.projects['git.openstack.org/openstack-infra/zuul'].src_dir }}"
+      zuul_work_dir: "{{ zuul.projects['opendev.org/zuul/zuul'].src_dir }}"
       tox_envlist: nodepool
 
 # NOTE(ianw): this job doesn't really do anything unless you set
@@ -27,7 +27,7 @@
     post-run: playbooks/nodepool-functional-base/post.yaml
     timeout: 5400
     required-projects:
-      - openstack-infra/nodepool
+      - zuul/nodepool
     vars:
       devstack_localrc:
         USE_PYTHON3: True
@@ -55,7 +55,7 @@
         n-api-meta: false
         q-meta: false
       devstack_plugins:
-        nodepool: https://git.openstack.org/openstack-infra/nodepool
+        nodepool: https://opendev.org/zuul/nodepool
       zuul_copy_output:
         '/var/log/nodepool/builds': 'logs'
 
@@ -75,8 +75,8 @@
     run: playbooks/nodepool-functional-py35-src/run.yaml
     required-projects:
       - name: github.com/sqlalchemy/dogpile.cache
-      - name: openstack-infra/glean
-      - name: openstack-infra/nodepool
+      - name: opendev/glean
+      - name: zuul/nodepool
       - name: openstack/diskimage-builder
       - name: openstack/openstacksdk
 
@@ -138,7 +138,7 @@
     post-run: playbooks/nodepool-functional-k8s/post.yaml
     nodeset: ubuntu-xenial
     required-projects:
-      - openstack-infra/nodepool
+      - zuul/nodepool
 
 - job:
     description: |
@@ -153,7 +153,7 @@
         - name: launcher
           label: fedora-28
     required-projects:
-      - openstack-infra/nodepool
+      - zuul/nodepool
 
 - secret:
     name: nodepool-dockerhub

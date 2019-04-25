@@ -28,4 +28,7 @@ FROM nodepool as nodepool-launcher
 CMD ["/usr/local/bin/nodepool-launcher", "-f"]
 
 FROM nodepool as nodepool-builder
+RUN apt update \
+  && apt install -y procps sudo curl qemu-utils kpartx \
+  && mkdir /opt/dib_tmp
 CMD ["/usr/local/bin/nodepool-builder", "-f"]

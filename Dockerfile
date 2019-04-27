@@ -21,14 +21,15 @@ RUN assemble
 FROM opendevorg/python-base as nodepool
 
 COPY --from=builder /output/ /output
-RUN /output/install-from-bindep
+RUN apt-get update \
+  && apt-get install -y less vim \
+  && /output/install-from-bindep
 CMD ["/usr/local/bin/nodepool"]
 
 FROM nodepool as nodepool-launcher
 CMD ["/usr/local/bin/nodepool-launcher", "-f"]
 
 FROM nodepool as nodepool-builder
-RUN apt update \
-  && apt install -y procps sudo curl qemu-utils gdisk kpartx \
+RUN apt-get install -y procps sudo curl qemu-utils gdisk kpartx \
   && mkdir /opt/dib_tmp
 CMD ["/usr/local/bin/nodepool-builder", "-f"]

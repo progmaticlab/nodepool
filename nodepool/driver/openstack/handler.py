@@ -167,6 +167,11 @@ class NodeLauncher(threading.Thread, stats.StatsReporter):
             self._node.az = server.location.zone
 
         interface_ip = server.interface_ip
+        if not interface_ip and server.addresses:
+            for key in server.addresses:
+                data = server.addresses.get(key)
+                if data and 'addr' in data[0]:
+                    interface_ip = data[0]['addr']
         if not interface_ip:
             self.log.debug(
                 "Server data for failed IP: %s" % pprint.pformat(

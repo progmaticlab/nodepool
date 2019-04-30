@@ -27,6 +27,13 @@ from nodepool import stats
 from nodepool import zk
 
 
+class NodeLogAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        msg, kwargs = super().process(msg, kwargs)
+        msg = '[node: %s] %s' % (kwargs['extra']['node_id'], msg)
+        return msg, kwargs
+
+
 class NodeLauncher(threading.Thread,
                    stats.StatsReporter,
                    metaclass=abc.ABCMeta):
@@ -45,7 +52,8 @@ class NodeLauncher(threading.Thread,
         '''
         threading.Thread.__init__(self, name="NodeLauncher-%s" % node.id)
         stats.StatsReporter.__init__(self)
-        self.log = logging.getLogger("nodepool.NodeLauncher-%s" % node.id)
+        logger = logging.getLogger("nodepool.NodeLauncher")
+        self.log = NodeLogAdapter(logger, {'node_id': node.id})
         self.zk = zk_conn
         self.node = node
         self.provider_config = provider_config

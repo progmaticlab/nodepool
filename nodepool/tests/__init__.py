@@ -17,6 +17,7 @@
 
 import glob
 import itertools
+import kubernetes.config.kube_config
 import logging
 import os
 import random
@@ -188,6 +189,16 @@ class BaseTestCase(testtools.TestCase):
         self.useFixture(fixtures.MonkeyPatch('subprocess.Popen',
                                              LoggingPopenFactory))
         self.setUpFakes()
+
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        # This is a hack to cleanup kubernetes temp files during test runs.
+        # The kube_config maintains a global dict of temporary files. During
+        # running the tests those can get deleted during the cleanup phase of
+        # the tests without kube_config knowing about this so forcefully tell
+        # kube_config to clean this up.
+        kubernetes.config.kube_config._cleanup_temp_files()
 
     def setUpFakes(self):
         clouds_path = os.path.join(os.path.dirname(__file__),

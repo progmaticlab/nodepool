@@ -239,6 +239,7 @@
     post:
       jobs:
         - publish-zuul-docs
+        - release-zuul-python
     promote:
       jobs:
         - nodepool-promote-image

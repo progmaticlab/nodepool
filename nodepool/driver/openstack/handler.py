@@ -113,10 +113,9 @@ class NodeLauncher(threading.Thread, stats.StatsReporter):
         )
 
         self.log.info("Creating server with hostname %s in %s from image %s "
-                      "for node id: %s" % (hostname,
-                                           self._provider_config.name,
-                                           image_name,
-                                           self._node.id))
+                      "for node id: %s. Networks: ." % (
+                          hostname, self._provider_config.name,image_name,
+                          self._node.id, str(self._pool.networks)))
 
         # NOTE: We store the node ID in the server metadata to use for leaked
         # instance detection. We cannot use the external server ID for this
@@ -167,11 +166,12 @@ class NodeLauncher(threading.Thread, stats.StatsReporter):
             self._node.az = server.location.zone
 
         interface_ip = server.interface_ip
-        if not interface_ip and server.addresses:
-            for key in server.addresses:
-                data = server.addresses.get(key)
-                if data and 'addr' in data[0]:
-                    interface_ip = data[0]['addr']
+        if not interface_ip and server.addresses and self._pool.networks:
+            # we need address from first network only
+            network = self._pool.networks[0]
+            data = server.addresses.get(network)
+            if data and 'addr' in data[0]:
+                interface_ip = data[0]['addr']
         if not interface_ip:
             self.log.debug(
                 "Server data for failed IP: %s" % pprint.pformat(

@@ -63,6 +63,25 @@ class TestDriverStatic(tests.DBTestCase):
         self.assertEqual(nodes[0].connection_type, 'ssh')
         self.assertEqual(nodes[0].host_keys, ['ssh-rsa FAKEKEY'])
 
+    def test_static_python_path(self):
+        '''
+        Test that static python-path works.
+        '''
+        configfile = self.setup_config('static-python-path.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        pool.start()
+
+        self.log.debug("Waiting for node pre-registration")
+        nodes = self.waitForNodes('fake-label')
+        self.assertEqual(nodes[0].python_path, "/usr/bin/python3")
+
+        nodes[0].state = zk.USED
+        self.zk.storeNode(nodes[0])
+
+        self.log.debug("Waiting for node to be re-available")
+        nodes = self.waitForNodes('fake-label')
+        self.assertEqual(nodes[0].python_path, "/usr/bin/python3")
+
     def test_static_unresolvable(self):
         '''
         Test that basic node registration works.

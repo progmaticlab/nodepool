@@ -10,7 +10,7 @@ function build() {
   if [[ "$NODEPOOL_CLEAN" == "1" ]]; then
     docker image rm ${NODEPOOL_DOCKERREPO}/nodepool-$name:${NODEPOOL_VERSION} || /bin/true
   fi
-  docker build --target nodepool-launcher -t ${NODEPOOL_DOCKERREPO}/nodepool-$name:${NODEPOOL_VERSION} .
+  docker build --target nodepool-$name -t ${NODEPOOL_DOCKERREPO}/nodepool-$name:${NODEPOOL_VERSION} .
   if [[ "$NODEPOOL_PUSH" == "1" ]]; then
     docker push ${NODEPOOL_DOCKERREPO}/nodepool-$name:${NODEPOOL_VERSION}
   fi

@@ -113,8 +113,8 @@ class NodeLauncher(threading.Thread, stats.StatsReporter):
         )
 
         self.log.info("Creating server with hostname %s in %s from image %s "
-                      "for node id: %s. Networks: ." % (
-                          hostname, self._provider_config.name,image_name,
+                      "for node id: %s. Networks: %s." % (
+                          hostname, self._provider_config.name, image_name,
                           self._node.id, str(self._pool.networks)))
 
         # NOTE: We store the node ID in the server metadata to use for leaked

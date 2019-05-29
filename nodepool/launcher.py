@@ -527,7 +527,12 @@ class CleanupWorker(BaseCleanupWorker):
         for provider in self._nodepool.config.providers.values():
             manager = self._nodepool.getProviderManager(provider.name)
             if manager:
-                manager.cleanupLeakedResources()
+                try:
+                    manager.cleanupLeakedResources()
+                except Exception:
+                    self.log.exception(
+                        "Failure during resource cleanup for provider %s",
+                        provider.name)
 
     def _cleanupMaxReadyAge(self):
         '''

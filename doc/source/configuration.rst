@@ -493,8 +493,8 @@ Selecting the OpenStack driver adds the following options to the
       to be able to reach instances.
 
       More information about the contents of `clouds.yaml` can be
-      found in `the os-client-config documentation
-      <http://docs.openstack.org/developer/os-client-config/>`_.
+      found in `the openstacksdk documentation
+      <https://docs.openstack.org/openstacksdk/>`_.
 
    .. attr:: boot-timeout
       :type: int seconds

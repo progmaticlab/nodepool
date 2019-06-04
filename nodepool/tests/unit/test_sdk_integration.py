@@ -42,7 +42,7 @@ class TestShadeIntegration(tests.IntegrationTestCase):
 
     def test_nodepool_provider_config_bad(self):
         # nodepool doesn't support clouds.yaml-less config anymore
-        # Assert that we get a nodepool error and not an os-client-config
+        # Assert that we get a nodepool error and not an openstacksdk
         # error.
         self.assertRaises(
             voluptuous.MultipleInvalid,

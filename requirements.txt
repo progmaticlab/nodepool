@@ -7,7 +7,8 @@ extras
 statsd>=3.0
 PrettyTable>=0.6,<0.8
 # openstacksdk before 0.27.0 is TaskManager based
-openstacksdk>=0.27.0
+# 0.28.0-0.31.0 fail to upload images with glance tasks.
+openstacksdk>=0.27.0,!=0.28.0,!=0.29.0,!=0.30.0,!=0.31.0
 diskimage-builder>=2.0.0
 voluptuous
 kazoo

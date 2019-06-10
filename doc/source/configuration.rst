@@ -893,6 +893,11 @@ Selecting the OpenStack driver adds the following options to the
            Mutually exclusive with
            :attr:`providers.[openstack].pools.labels.diskimage`
 
+        .. attr:: key-name
+           :type: str
+
+           Name or id of the ssh key to use.
+
         .. attr:: flavor-name
            :type: str
 

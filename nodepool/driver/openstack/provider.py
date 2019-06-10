@@ -83,6 +83,7 @@ class OpenStackProvider(Provider):
             rate_limit = 1 / self.provider.rate
         return openstack.connection.Connection(
             config=self.provider.cloud_config,
+            use_direct_get=False,
             rate_limit=rate_limit,
             statsd_host=os.getenv('STATSD_HOST', None),
             statsd_port=os.getenv('STATSD_PORT ', None),

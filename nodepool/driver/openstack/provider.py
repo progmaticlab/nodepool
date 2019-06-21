@@ -51,7 +51,10 @@ class OpenStackProvider(Provider):
         self._zk = None
         self._down_ports = set()
         self._last_port_cleanup = None
-        self._port_cleanup_interval_secs = 180
+        # Set this long enough to avoid deleting a port which simply
+        # hasn't yet been attached to an instance which is being
+        # created.
+        self._port_cleanup_interval_secs = 600
         self._statsd = stats.get_client()
 
     def start(self, zk_conn):

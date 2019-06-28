@@ -49,7 +49,13 @@ class KubernetesProvider(Provider):
             self.namespace_names.add(pool.name)
 
     def _get_client(self, context):
-        conf = config.new_client_from_config(context=context)
+        try:
+            conf = config.new_client_from_config(context=context)
+        except FileNotFoundError:
+            self.log.debug("Kubernetes config file not found, attempting "
+                           "to load in-cluster configs")
+            conf = config.load_incluster_config()
+
         return (
             k8s_client.CoreV1Api(conf),
             k8s_client.RbacAuthorizationV1beta1Api(conf))

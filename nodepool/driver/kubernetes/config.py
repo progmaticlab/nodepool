@@ -109,7 +109,7 @@ class KubernetesProviderConfig(ProviderConfig):
 
         provider = {
             v.Required('pools'): [pool],
-            v.Required('context'): str,
+            'context': str,
             'launch-retries': int,
         }
 

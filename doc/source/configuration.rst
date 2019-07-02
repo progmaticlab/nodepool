@@ -1163,13 +1163,15 @@ Selecting the kubernetes driver adds the following options to the
 
 
    .. attr:: context
-      :required:
 
       Name of the context configured in ``kube/config``.
 
-      Before using the driver, Nodepool services need a
-      ``kube/config`` file manually installed with cluster admin
-      context.
+      Before using the driver, Nodepool either needs a ``kube/config``
+      file installed with a cluster admin context, in which case this
+      setting is required, or if Nodepool is running inside
+      Kubernetes, this setting and the ``kube/config`` file may be
+      omitted and Nodepool will use a service account loaded from the
+      in-cluster configuration path.
 
    .. attr:: launch-retries
       :default: 3

@@ -14,12 +14,18 @@
 
 import logging
 
+from nodepool import zk
 from nodepool.driver import NodeRequestHandler
 
 
 class StaticNodeRequestHandler(NodeRequestHandler):
     log = logging.getLogger("nodepool.driver.static."
                             "StaticNodeRequestHandler")
+
+    DONE_STATES = {zk.READY, zk.FAILED}
+
+    def _check_node_state(self, node, deleted):
+        return not (node.state in self.DONE_STATES or deleted)
 
     @property
     def alive_thread_count(self):
@@ -33,17 +39,19 @@ class StaticNodeRequestHandler(NodeRequestHandler):
         return True
 
     def hasRemainingQuota(self, ntype):
-        # We are always at quota since we cannot launch new nodes.
-        return False
+        # A pool of static nodes can manage nodes with different labels.
+        # There is no global quota that we can exceed here. Return true
+        # so we can wait for the required node type and don't block
+        # other node requests.
+        return True
 
     def launch(self, node):
-        # NOTE: We do not expect this to be called since hasRemainingQuota()
-        # returning False should prevent the call.
-        raise Exception("Node launching not supported by static driver")
+        self.log.debug("Waiting for node %s to be ready", node.id)
+        self.zk.watchNode(node, self._check_node_state)
 
     def launchesComplete(self):
-        # We don't wait on a launch since we never actually launch.
-        return True
+        node_states = [node.state for node in self.nodeset]
+        return all(s in self.DONE_STATES for s in node_states)
 
     def checkReusableNode(self, node):
         return self.manager.checkNodeLiveness(node)

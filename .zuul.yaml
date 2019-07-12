@@ -174,7 +174,7 @@
     check:
       jobs:
         - nodepool-build-image
-        - tox-docs
+        - zuul-tox-docs
         - tox-pep8
         - tox-py35:
             nodeset: ubuntu-xenial
@@ -187,24 +187,25 @@
         - nodepool-functional-openshift
         - zuul-quick-start:
             dependencies: nodepool-build-image
+        - build-python-release
     gate:
       jobs:
         - nodepool-upload-image
-        - tox-docs
+        - zuul-tox-docs
         - tox-pep8
         - tox-py35:
             nodeset: ubuntu-xenial
         - tox-py36
         - zuul-quick-start:
             dependencies: nodepool-upload-image
-    post:
-      jobs:
-        - publish-zuul-docs
-        - release-zuul-python
+        - build-python-release
     promote:
       jobs:
         - nodepool-promote-image
+        - zuul-promote-docs
+        - opendev-promote-python
+        - opendev-promote-javascript-content
     release:
       jobs:
-        - release-zuul-python
-        - publish-zuul-docs
+        - opendev-release-python
+        - zuul-publish-tox-docs

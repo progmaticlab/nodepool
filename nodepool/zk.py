@@ -1900,6 +1900,27 @@ class ZooKeeper(object):
             path = self._nodePath(node.id)
             self.client.set(path, node.serialize())
 
+    def watchNode(self, node, callback):
+        '''Watch an existing node for changes.
+
+        :param Node node: The node object to watch.
+        :param callable callback: A callable object that will be invoked each
+            time the node is updated. It is called with two arguments (node,
+            deleted) where 'node' is the same argument passed to this method,
+            and 'deleted' is a boolean which is True if the node no longer
+            exists. The callback should return False when further updates are
+            no longer necessary.
+        '''
+        def _callback_wrapper(data, stat):
+            if data is not None:
+                node.updateFromDict(self._bytesToDict(data))
+
+            deleted = data is None
+            return callback(node, deleted)
+
+        path = self._nodePath(node.id)
+        self.client.DataWatch(path, _callback_wrapper)
+
     def deleteRawNode(self, node_id):
         '''
         Delete a znode for a Node.

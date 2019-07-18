@@ -92,6 +92,17 @@ class StaticNodeProvider(Provider):
             nodes.append(node)
         return nodes
 
+    def getWaitingNodesOfType(self, labels):
+        nodes = []
+        for node in self.zk.nodeIterator():
+            if (node.provider != self.provider.name or
+                node.state != zk.BUILDING or
+                not set(node.type).issubset(labels)
+            ):
+                continue
+            nodes.append(node)
+        return nodes
+
     def checkNodeLiveness(self, node):
         static_node = self.poolNodes().get(node.hostname)
         if static_node is None:
@@ -137,15 +148,22 @@ class StaticNodeProvider(Provider):
         A node can be registered multiple times to support max-parallel-jobs.
         These nodes will share a hostname.
 
+        In case there are 'building' nodes waiting for a label, those nodes
+        will be updated and marked 'ready'.
+
         :param int count: Number of times to register this node.
         :param str provider_name: Name of the provider.
         :param str pool_name: Name of the pool owning the node.
         :param dict static_node: The node definition from the config file.
         '''
         host_keys = self.checkHost(static_node)
+        waiting_nodes = self.getWaitingNodesOfType(static_node["labels"])
 
         for i in range(0, count):
-            node = zk.Node()
+            try:
+                node = waiting_nodes.pop()
+            except IndexError:
+                node = zk.Node()
             node.state = zk.READY
             node.provider = provider_name
             node.pool = pool_name

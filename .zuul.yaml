@@ -208,7 +208,6 @@
         - nodepool-promote-image
         - zuul-promote-docs
         - opendev-promote-python
-        - opendev-promote-javascript-content
     release:
       jobs:
         - opendev-release-python

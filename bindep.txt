@@ -3,8 +3,8 @@
 
 gcc [compile test]
 libffi-devel [platform:rpm]
-libffi-dev [platform:dpkg]
-libffi-dev [compile test platform:apk]
+libffi-dev [compile test platform:apk platform:dpkg]
+libffi6 [platform:dpkg]
 libffi [platform:apk]
 libressl-dev [compile test platform:apk]
 linux-headers [compile test platform:apk]

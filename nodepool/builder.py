@@ -1059,8 +1059,9 @@ class UploadWorker(BaseWorker):
                 sha256=image.sha256,
             )
         except Exception:
-            self.log.exception("Failed to upload image %s to provider %s" %
-                               (image_name, provider.name))
+            self.log.exception(
+                "Failed to upload build %s of image %s to provider %s" %
+                (build_id, image_name, provider.name))
             data = zk.ImageUpload()
             data.state = zk.FAILED
             return data

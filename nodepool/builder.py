@@ -291,6 +291,7 @@ class CleanupWorker(BaseWorker):
         for upload in all_uploads:
             if self._isRecentUpload(image, provider.name, build_id, upload.id):
                 continue
+            self.log.debug("Deleting non-recent image upload: %s", upload)
             self._deleteUpload(upload)
 
     def _cleanupObsoleteProviderUploads(self, provider, image, build_id):
@@ -300,6 +301,7 @@ class CleanupWorker(BaseWorker):
 
         all_uploads = self._zk.getUploads(image, build_id, provider.name)
         for upload in all_uploads:
+            self.log.debug("Deleting obsolete image upload: %s", upload)
             self._deleteUpload(upload)
 
     def _deleteUpload(self, upload):

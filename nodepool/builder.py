@@ -204,8 +204,6 @@ class CleanupWorker(BaseWorker):
                 self._rtable[i][p].sort(key=lambda x: x[2], reverse=True)
                 self._rtable[i][p] = self._rtable[i][p][:2]
 
-        self.log.debug("Upload recency table: %s", self._rtable)
-
     def _isRecentUpload(self, image, provider, build_id, upload_id):
         '''
         Search for an upload for a build within the recency table.

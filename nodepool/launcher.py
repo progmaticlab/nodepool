@@ -481,19 +481,26 @@ class CleanupWorker(BaseCleanupWorker):
                     # with a different name, owns this.
                     continue
 
-                if not zk_conn.getNode(meta['nodepool_node_id']):
-                    self.log.warning(
-                        "Marking for delete leaked instance %s (%s) in %s "
-                        "(unknown node id %s)",
-                        server.name, server.id, provider.name,
-                        meta['nodepool_node_id']
-                    )
-                    # Create an artifical node to use for deleting the server.
-                    node = zk.Node()
-                    node.external_id = server.id
-                    node.provider = provider.name
-                    node.state = zk.DELETING
-                    zk_conn.storeNode(node)
+                if zk_conn.getNode(meta['nodepool_node_id']):
+                    continue
+                # check if this node is already present in ZK with another zk id but with same external_id
+                # in some cases timeouts didn't work well
+                node = next((node for node in zk_conn.nodeIterator() if node.external_id = server.id), None)
+                if node:
+                    continue
+
+                self.log.warning(
+                    "Marking for delete leaked instance %s (%s) in %s "
+                    "(unknown node id %s)",
+                    server.name, server.id, provider.name,
+                    meta['nodepool_node_id']
+                )
+                # Create an artifical node to use for deleting the server.
+                node = zk.Node()
+                node.external_id = server.id
+                node.provider = provider.name
+                node.state = zk.DELETING
+                zk_conn.storeNode(node)
 
             manager.cleanupLeakedResources()
 

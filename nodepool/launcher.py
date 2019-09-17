@@ -485,7 +485,7 @@ class CleanupWorker(BaseCleanupWorker):
                     continue
                 # check if this node is already present in ZK with another zk id but with same external_id
                 # in some cases timeouts didn't work well
-                node = next((node for node in zk_conn.nodeIterator() if node.external_id = server.id), None)
+                node = next((node for node in zk_conn.nodeIterator() if node.external_id == server.id), None)
                 if node:
                     continue
 

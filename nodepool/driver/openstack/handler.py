@@ -115,10 +115,11 @@ class OpenStackNodeLauncher(NodeLauncher):
         )
 
         self.log.info("Creating server with hostname %s in %s from image %s "
-                      "for node id: %s" % (hostname,
+                      "for node id: %s. Networks: %s." % (hostname,
                                            self.provider_config.name,
                                            image_name,
-                                           self.node.id))
+                                           self.node.id,
+                                           self._pool.networks))
 
         # NOTE: We store the node ID in the server metadata to use for leaked
         # instance detection. We cannot use the external server ID for this
@@ -187,6 +188,12 @@ class OpenStackNodeLauncher(NodeLauncher):
             self.node.az = server.location.zone
 
         interface_ip = server.interface_ip
+        if not interface_ip and server.addresses and self._pool.networks:
+            # we need address from first network only
+            network = self._pool.networks[0]
+            data = server.addresses.get(network)
+            if data and 'addr' in data[0]:
+                interface_ip = data[0]['addr']
         if not interface_ip:
             self.log.debug(
                 "Server data for failed IP: %s" % pprint.pformat(

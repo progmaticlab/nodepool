@@ -205,24 +205,145 @@ alien-image-list
 Removing a Provider
 -------------------
 
-To remove a provider, remove all of the images from that provider`s
-configuration (and remove all instances of that provider from any
-labels) and set that provider's max-servers to -1.  This will instruct
-Nodepool to delete any images uploaded to that provider, not upload
-any new ones, and stop booting new nodes on the provider.  You can
-then let the nodes go through their normal lifecycle.  Once all nodes
-have been deleted you remove the config from nodepool for that
-provider entirely (though leaving it in this state is effectively the
-same and makes it easy to turn the provider back on).
+Removing a provider from nodepool involves two separate steps: removing from
+the builder process, and removing from the launcher process.
 
-If urgency is required you can delete the nodes directly instead of
-waiting for them to go through their normal lifecycle but the effect
-is the same.
+.. warning::
+
+  Since the launcher process depends on images being present in the provider,
+  you should follow the process for removing a provider from the launcher
+  before doing the steps to remove it from the builder.
+
+Removing from the Launcher
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To remove a provider from the launcher, set that provider's ``max-servers``
+value to 0 (or any value less than 0). This disables the provider and will
+instruct the launcher to stop booting new nodes on the provider. You can then
+let the nodes go through their normal lifecycle. Once all nodes have been
+deleted, you may remove the provider from launcher configuration file entirely,
+although leaving it in this state is effectively the same and makes it easy
+to turn the provider back on.
+
+.. note::
+
+  There is currently no way to force the launcher to immediately begin
+  deleting any unused instances from a disabled provider. If urgency is
+  required, you can delete the nodes directly instead of waiting for them
+  to go through their normal lifecycle, but the effect is the same.
+
+For example, if you want to remove ProviderA from a launcher with a
+configuration file defined as::
+
+  providers:
+    - name: ProviderA
+      region-name: region1
+      cloud: ProviderA
+      boot-timeout: 120
+      diskimages:
+        - name: centos
+        - name: fedora
+      pools:
+        - name: main
+          max-servers: 100
+          labels:
+            - name: centos
+              min-ram: 8192
+              flavor-name: Performance
+              diskimage: centos
+              key-name: root-key
+
+Then you would need to alter the configuration to::
+
+  providers:
+    - name: ProviderA
+      region-name: region1
+      cloud: ProviderA
+      boot-timeout: 120
+      diskimages:
+        - name: centos
+        - name: fedora
+      pools:
+        - name: main
+          max-servers: 0
+          labels:
+            - name: centos
+              min-ram: 8192
+              flavor-name: Performance
+              diskimage: centos
+              key-name: root-key
+
+.. note::
+
+  The launcher process will automatically notice any changes in its
+  configuration file, so there is no need to restart the service to
+  pick up the change.
+
+Removing from the Builder
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The builder controls image building, uploading, and on-disk cleanup.
+The builder needs a chance to properly manage these resources for a removed
+a provider. To do this, you need to first set the ``diskimage`` configuration
+section for the provider you want to remove to an empty list.
+
+.. warning::
+
+  Make sure the provider is disabled in the launcher before disabling in
+  the builder.
+
+For example, if you want to remove ProviderA from a builder with a
+configuration file defined as::
+
+  providers:
+    - name: ProviderA
+      region-name: region1
+      diskimages:
+        - name: centos
+        - name: fedora
+
+  diskimages:
+    - name: centos
+      pause: false
+      elements:
+        - centos-minimal
+        ...
+      env-vars:
+        ...
+
+Then you would need to alter the configuration to::
+
+  providers:
+    - name: ProviderA
+      region-name: region1
+      diskimages: []
+
+  diskimages:
+    - name: centos
+      pause: false
+      elements:
+        - centos-minimal
+        ...
+      env-vars:
+        ...
+
+By keeping the provider defined in the configuration file, but changing
+the ``diskimages`` to an empty list, you signal the builder to cleanup
+resources for that provider, including any images already uploaded, any
+on-disk images, and any image data stored in ZooKeeper. After those
+resources have been cleaned up, it is safe to remove the provider from the
+configuration file entirely, if you wish to do so.
+
+.. note::
+
+  The builder process will automatically notice any changes in its
+  configuration file, so there is no need to restart the service to
+  pick up the change.
 
 Web interface
 -------------
 
-If configured (see :ref:`webapp-conf`), a ``nodepool-launcher``
+If configured (see :attr:`webapp-conf`), a ``nodepool-launcher``
 instance can provide a range of end-points that can provide
 information in text and ``json`` format.  Note if there are multiple
 launchers, all will provide the same information.
@@ -272,3 +393,146 @@ launchers, all will provide the same information.
    :reqheader Accept: ``application/json`` or ``text/*``
    :resheader Content-Type: ``application/json`` or ``text/plain``
                             depending on the :http:header:`Accept` header
+
+Monitoring
+----------
+
+Nodepool provides monitoring information to statsd. See
+:ref:`statsd_configuration` to learn how to enable statsd support. Currently,
+these metrics are supported:
+
+Nodepool builder
+~~~~~~~~~~~~~~~~
+
+.. zuul:stat:: nodepool.dib_image_build.<diskimage_name>.<ext>.size
+   :type: gauge
+
+   This stat reports the size of the built image in bytes.  ``ext`` is
+   based on the formats of the images created for the build, for
+   example ``qcow2``, ``raw``, ``vhd``, etc.
+
+.. zuul:stat:: nodepool.dib_image_build.<diskimage_name>.status.rc
+   :type: gauge
+
+   Return code of the last DIB run.  Zero is successful, non-zero is
+   unsuccessful.
+
+.. zuul:stat:: nodepool.dib_image_build.<diskimage_name>.status.duration
+   :type: timer
+
+   Time the last DIB run for this image build took, in ms
+
+.. zuul:stat:: nodepool.dib_image_build.<diskimage_name>.status.last_build
+   :type: gauge
+
+   The UNIX timestamp of the last time a build for this image
+   returned.  This can be useful for presenting a relative time ("X
+   hours ago") in a dashboard.
+
+.. zuul:stat:: nodepool.image_update.<image name>.<provider name>
+   :type: counter, timer
+
+   Number of image uploads to a specific provider in the cloud plus the time in
+   seconds spent to upload the image.
+
+Nodepool launcher
+~~~~~~~~~~~~~~~~~
+
+.. zuul:stat:: nodepool.provider.<provider>.max_servers
+   :type: gauge
+
+   Current setting of the max-server configuration parameter for the respective
+   provider.
+
+.. _nodepool_nodes:
+
+.. zuul:stat:: nodepool.nodes.<state>
+  :type: counter
+
+   Number of nodes in a specific state.
+
+   state can be:
+
+   * building
+   * deleting
+   * failed
+   * in-use
+   * ready
+   * used
+
+.. zuul:stat:: nodepool.provider.<provider>.downPorts
+   :type: counter
+
+   Number of ports in the DOWN state that have been removed automatically
+   in the cleanup resources phase of the OpenStack driver.
+
+.. zuul:stat:: nodepool.provider.<provider>.nodes.<state>
+   :type: gauge
+
+   Number of nodes per provider that are in one specific state. See
+   :ref:`nodepool.nodes <nodepool_nodes>` for a list of possible states.
+
+.. zuul:stat:: nodepool.label.<label>.nodes.<state>
+   :type: counter
+
+   Number of nodes with a specific label in a specific state. See
+   :ref:`nodepool.nodes <nodepool_nodes>` for a list of possible states.
+
+.. zuul:stat:: nodepool.task.<provider>.<task>
+   :type: counter, timer
+
+   Number of tasks executed per provider plus the duration of the task
+   execution.
+
+.. _nodepool_launch:
+
+.. zuul:stat:: nodepool.launch.<result>
+   :type: counter, timer
+
+   Number of launches, categorized by the launch result plus the duration
+   of the launch.
+
+   *result* can be:
+
+   * ready: launch was successful
+   * error.zksession: Zookeeper session was lost
+   * error.quota: Quota of the provider was reached
+   * error.unknown: Some other error during launch
+
+.. zuul:stat:: nodepool.launch.provider.<provider>.<az>.<result>
+   :type: counter, timer
+
+   Number of launches per provider per availability zone, categorized
+   by the launch result plus duration of the launch.
+
+   See :ref:`nodepool.launch <nodepool_launch>` for a list of possible results.
+
+.. zuul:stat:: nodepool.launch.image.<image>.<result>
+   :type: counter, timer
+
+   Number of launches per image, categorized by the launch result plus duration
+   of the launch.
+
+   See :ref:`nodepool.launch <nodepool_launch>` for a list of possible results.
+
+.. zuul:stat:: nodepool.launch.requestor.<requestor>.<result>
+   :type: counter, timer
+
+   Number of launches per requestor, categorized by the launch result plus the
+   duration of the launch.
+
+   See :ref:`nodepool.launch <nodepool_launch>` for a list of possible results.
+
+OpenStack API stats
+~~~~~~~~~~~~~~~~~~~
+
+Low level details on the timing of OpenStack API calls will be logged
+by ``openstacksdk``. These calls are logged under
+``nodepool.task.<provider>.<api-call>``.  The API call name is of the
+generic format ``<service-type>.<method>.<operation>``. For example, the
+``GET /servers`` call to the ``compute`` service becomes
+``compute.GET.servers``.
+
+Since these calls reflect the internal operations of the
+``openstacksdk``, the exact keys logged may vary across providers and
+releases.

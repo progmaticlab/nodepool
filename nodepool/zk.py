@@ -17,11 +17,13 @@ from copy import copy
 import abc
 import json
 import logging
-import six
 import time
 from kazoo.client import KazooClient, KazooState
 from kazoo import exceptions as kze
+from kazoo.handlers.threading import KazooTimeoutError
 from kazoo.recipe.lock import Lock
+from kazoo.recipe.cache import TreeCache, TreeEvent
+from kazoo.recipe.election import Election
 
 from nodepool import exceptions as npe
 
@@ -52,6 +54,21 @@ USED = 'used'
 HOLD = 'hold'
 # Initial node state
 INIT = 'init'
+# Aborted due to a transient error like overquota that should not count as a
+# failed launch attempt
+ABORTED = 'aborted'
+# The node has actually been deleted and the Znode should be deleted
+DELETED = 'deleted'
+
+
+# NOTE(Shrews): Importing this from nodepool.config causes an import error
+# since that file imports this file.
+def as_list(item):
+    if not item:
+        return []
+    if isinstance(item, list):
+        return item
+    return [item]
 
 
 class ZooKeeperConnectionConfig(object):
@@ -150,6 +167,7 @@ class Launcher(Serializable):
 
     def __init__(self):
         self.id = None
+        self.provider_name = None
         self._supported_labels = set()
 
     def __eq__(self, other):
@@ -172,6 +190,7 @@ class Launcher(Serializable):
     def toDict(self):
         d = {}
         d['id'] = self.id
+        d['provider_name'] = self.provider_name
         # sets are not JSON serializable, so use a sorted list
         d['supported_labels'] = sorted(self.supported_labels)
         return d
@@ -180,6 +199,10 @@ class Launcher(Serializable):
     def fromDict(d):
         obj = Launcher()
         obj.id = d.get('id')
+        # TODO(tobiash): The fallback to 'unknown' is only needed to avoid
+        #                having a full nodepool shutdown on upgrade. It can be
+        #                removed later.
+        obj.provider_name = d.get('provider_name', 'unknown')
         obj.supported_labels = set(d.get('supported_labels', []))
         return obj
 
@@ -204,7 +227,7 @@ class BaseModel(Serializable):
 
     @id.setter
     def id(self, value):
-        if not isinstance(value, six.string_types):
+        if not isinstance(value, str):
             raise TypeError("'id' attribute must be a string type")
         self._id = value
 
@@ -260,6 +283,7 @@ class ImageBuild(BaseModel):
         self.builder = None       # Hostname
         self.builder_id = None    # Unique ID
         self.username = None
+        self.python_path = None
 
     def __repr__(self):
         d = self.toDict()
@@ -292,6 +316,7 @@ class ImageBuild(BaseModel):
         if len(self.formats):
             d['formats'] = ','.join(self.formats)
         d['username'] = self.username
+        d['python_path'] = self.python_path
         return d
 
     @staticmethod
@@ -309,6 +334,7 @@ class ImageBuild(BaseModel):
         o.builder = d.get('builder')
         o.builder_id = d.get('builder_id')
         o.username = d.get('username', 'zuul')
+        o.python_path = d.get('python_path', '/usr/bin/python2')
         # Only attempt the split on non-empty string
         if d.get('formats', ''):
             o.formats = d.get('formats', '').split(',')
@@ -322,13 +348,14 @@ class ImageUpload(BaseModel):
     VALID_STATES = set([UPLOADING, READY, DELETING, FAILED])
 
     def __init__(self, build_id=None, provider_name=None, image_name=None,
-                 upload_id=None, username=None):
+                 upload_id=None, username=None, python_path=None):
         super(ImageUpload, self).__init__(upload_id)
         self.build_id = build_id
         self.provider_name = provider_name
         self.image_name = image_name
         self.format = None
         self.username = username
+        self.python_path = python_path
         self.external_id = None      # Provider ID of the image
         self.external_name = None    # Provider name of the image
 
@@ -360,6 +387,7 @@ class ImageUpload(BaseModel):
         d['external_name'] = self.external_name
         d['format'] = self.format
         d['username'] = self.username
+        d['python_path'] = self.python_path
         return d
 
     @staticmethod
@@ -381,6 +409,7 @@ class ImageUpload(BaseModel):
         o.external_name = d.get('external_name')
         o.format = d.get('format')
         o.username = d.get('username', 'zuul')
+        o.python_path = d.get('python_path', '/usr/bin/python2')
         return o
 
 
@@ -419,6 +448,8 @@ class NodeRequest(BaseModel):
         self.nodes = []
         self.reuse = True
         self.requestor = None
+        self.provider = None
+        self.relative_priority = 0
 
     def __repr__(self):
         d = self.toDict()
@@ -433,7 +464,9 @@ class NodeRequest(BaseModel):
                     self.node_types == other.node_types and
                     self.nodes == other.nodes and
                     self.reuse == other.reuse and
-                    self.requestor == other.requestor)
+                    self.requestor == other.requestor and
+                    self.provider == other.provider and
+                    self.relative_priority == other.relative_priority)
         else:
             return False
 
@@ -447,6 +480,8 @@ class NodeRequest(BaseModel):
         d['nodes'] = self.nodes
         d['reuse'] = self.reuse
         d['requestor'] = self.requestor
+        d['provider'] = self.provider
+        d['relative_priority'] = self.relative_priority
         return d
 
     @staticmethod
@@ -461,12 +496,18 @@ class NodeRequest(BaseModel):
         '''
         o = NodeRequest(o_id)
         super(NodeRequest, o).fromDict(d)
-        o.declined_by = d.get('declined_by', [])
-        o.node_types = d.get('node_types', [])
-        o.nodes = d.get('nodes', [])
-        o.reuse = d.get('reuse', True)
-        o.requestor = d.get('requestor')
+        o.updateFromDict(d)
         return o
+
+    def updateFromDict(self, d):
+        super().fromDict(d)
+        self.declined_by = d.get('declined_by', [])
+        self.node_types = d.get('node_types', [])
+        self.nodes = d.get('nodes', [])
+        self.reuse = d.get('reuse', True)
+        self.requestor = d.get('requestor')
+        self.provider = d.get('provider')
+        self.relative_priority = d.get('relative_priority', 0)
 
 
 class Node(BaseModel):
@@ -474,7 +515,8 @@ class Node(BaseModel):
     Class representing a launched node.
     '''
     VALID_STATES = set([BUILDING, TESTING, READY, IN_USE, USED,
-                        HOLD, DELETING, FAILED, INIT])
+                        HOLD, DELETING, FAILED, INIT, ABORTED,
+                        DELETED])
 
     def __init__(self, id=None):
         super(Node, self).__init__(id)
@@ -482,13 +524,14 @@ class Node(BaseModel):
         self.cloud = None
         self.provider = None
         self.pool = None
-        self.type = None
+        self.__type = []
         self.allocated_to = None
         self.az = None
         self.region = None
         self.public_ipv4 = None
         self.private_ipv4 = None
         self.public_ipv6 = None
+        self.host_id = None
         self.interface_ip = None
         self.connection_port = 22
         self.image_id = None
@@ -502,6 +545,9 @@ class Node(BaseModel):
         self.connection_type = None
         self.host_keys = []
         self.hold_expiration = None
+        self.resources = None
+        self.attributes = None
+        self.python_path = None
 
     def __repr__(self):
         d = self.toDict()
@@ -524,6 +570,7 @@ class Node(BaseModel):
                     self.public_ipv4 == other.public_ipv4 and
                     self.private_ipv4 == other.private_ipv4 and
                     self.public_ipv6 == other.public_ipv6 and
+                    self.host_id == other.host_id and
                     self.interface_ip == other.interface_ip and
                     self.image_id == other.image_id and
                     self.launcher == other.launcher and
@@ -534,10 +581,24 @@ class Node(BaseModel):
                     self.hold_job == other.hold_job and
                     self.username == other.username and
                     self.connection_type == other.connection_type and
+                    self.connection_port == other.connection_port and
                     self.host_keys == other.host_keys and
-                    self.hold_expiration == other.hold_expiration)
+                    self.hold_expiration == other.hold_expiration and
+                    self.resources == other.resources and
+                    self.attributes == other.attributes and
+                    self.python_path == other.python_path)
         else:
             return False
+
+    @property
+    def type(self):
+        return self.__type
+
+    @type.setter
+    def type(self, value):
+        # Using as_list() here helps us to transition from existing Nodes
+        # in the ZooKeeper database that still use string.
+        self.__type = as_list(value)
 
     def toDict(self):
         '''
@@ -554,6 +615,7 @@ class Node(BaseModel):
         d['public_ipv4'] = self.public_ipv4
         d['private_ipv4'] = self.private_ipv4
         d['public_ipv6'] = self.public_ipv6
+        d['host_id'] = self.host_id
         d['interface_ip'] = self.interface_ip
         d['connection_port'] = self.connection_port
         # TODO(tobiash): ssh_port is kept for backwards compatibility reasons
@@ -569,7 +631,11 @@ class Node(BaseModel):
         d['host_keys'] = self.host_keys
         d['username'] = self.username
         d['connection_type'] = self.connection_type
+        d['connection_port'] = self.connection_port
         d['hold_expiration'] = self.hold_expiration
+        d['resources'] = self.resources
+        d['attributes'] = self.attributes
+        d['python_path'] = self.python_path
         return d
 
     @staticmethod
@@ -584,30 +650,56 @@ class Node(BaseModel):
         '''
         o = Node(o_id)
         super(Node, o).fromDict(d)
-        o.cloud = d.get('cloud')
-        o.provider = d.get('provider')
-        o.pool = d.get('pool')
-        o.type = d.get('type')
-        o.allocated_to = d.get('allocated_to')
-        o.az = d.get('az')
-        o.region = d.get('region')
-        o.public_ipv4 = d.get('public_ipv4')
-        o.private_ipv4 = d.get('private_ipv4')
-        o.public_ipv6 = d.get('public_ipv6')
-        o.interface_ip = d.get('interface_ip')
-        o.connection_port = d.get('connection_port', d.get('ssh_port', 22))
-        o.image_id = d.get('image_id')
-        o.launcher = d.get('launcher')
-        o.created_time = d.get('created_time')
-        o.external_id = d.get('external_id')
-        o.hostname = d.get('hostname')
-        o.comment = d.get('comment')
-        o.hold_job = d.get('hold_job')
-        o.username = d.get('username', 'zuul')
-        o.connection_type = d.get('connection_type')
-        o.host_keys = d.get('host_keys', [])
-        o.hold_expiration = d.get('hold_expiration')
+
+        o.updateFromDict(d)
         return o
+
+    def updateFromDict(self, d):
+        '''
+        Updates the Node object from a dictionary
+
+        :param dict d: The dictionary
+        '''
+        super().fromDict(d)
+        self.cloud = d.get('cloud')
+        self.provider = d.get('provider')
+        self.pool = d.get('pool')
+        self.type = d.get('type')
+        self.allocated_to = d.get('allocated_to')
+        self.az = d.get('az')
+        self.region = d.get('region')
+        self.public_ipv4 = d.get('public_ipv4')
+        self.private_ipv4 = d.get('private_ipv4')
+        self.public_ipv6 = d.get('public_ipv6')
+        self.host_id = d.get('host_id')
+        self.interface_ip = d.get('interface_ip')
+        self.connection_port = d.get('connection_port', d.get('ssh_port', 22))
+        self.image_id = d.get('image_id')
+        self.launcher = d.get('launcher')
+        self.created_time = d.get('created_time')
+        self.external_id = d.get('external_id')
+        self.hostname = d.get('hostname')
+        self.comment = d.get('comment')
+        self.hold_job = d.get('hold_job')
+        self.username = d.get('username', 'zuul')
+        self.connection_type = d.get('connection_type')
+        self.host_keys = d.get('host_keys', [])
+        hold_expiration = d.get('hold_expiration')
+        if hold_expiration is not None:
+            try:
+                # We try to force this to an integer value because we do
+                # relative second based age comparisons using this value
+                # and those need to be a number type.
+                self.hold_expiration = int(hold_expiration)
+            except ValueError:
+                # Coercion to int failed, just use default of 0,
+                # which means no expiration
+                self.hold_expiration = 0
+        else:
+            self.hold_expiration = hold_expiration
+        self.resources = d.get('resources')
+        self.attributes = d.get('attributes')
+        self.python_path = d.get('python_path')
 
 
 class ZooKeeper(object):
@@ -633,17 +725,32 @@ class ZooKeeper(object):
     NODE_ROOT = "/nodepool/nodes"
     REQUEST_ROOT = "/nodepool/requests"
     REQUEST_LOCK_ROOT = "/nodepool/requests-lock"
+    ELECTION_ROOT = "/nodepool/elections"
 
-    def __init__(self):
+    # Log zookeeper retry every 10 seconds
+    retry_log_rate = 10
+
+    def __init__(self, enable_cache=True):
         '''
         Initialize the ZooKeeper object.
         '''
         self.client = None
         self._became_lost = False
+        self._last_retry_log = 0
+        self._node_cache = None
+        self._request_cache = None
+        self._cached_nodes = {}
+        self._cached_node_requests = {}
+        self.enable_cache = enable_cache
+
+        self.node_stats_event = None
 
     # =======================================================================
     # Private Methods
     # =======================================================================
+
+    def _electionPath(self, election):
+        return "%s/%s" % (self.ELECTION_ROOT, election)
 
     def _imagePath(self, image):
         return "%s/%s" % (self.IMAGE_ROOT, image)
@@ -767,6 +874,15 @@ class ZooKeeper(object):
         else:
             self.log.debug("ZooKeeper connection: CONNECTED")
 
+    def logConnectionRetryEvent(self):
+        '''
+        Kazoo retry callback
+        '''
+        now = time.monotonic()
+        if now - self._last_retry_log >= self.retry_log_rate:
+            self.log.warning("Retrying zookeeper connection")
+            self._last_retry_log = now
+
     # =======================================================================
     # Public Methods and Properties
     # =======================================================================
@@ -813,7 +929,24 @@ class ZooKeeper(object):
             hosts = buildZooKeeperHosts(host_list)
             self.client = KazooClient(hosts=hosts, read_only=read_only)
             self.client.add_listener(self._connection_listener)
-            self.client.start()
+            # Manually retry initial connection attempt
+            while True:
+                try:
+                    self.client.start(1)
+                    break
+                except KazooTimeoutError:
+                    self.logConnectionRetryEvent()
+
+            if self.enable_cache:
+                self._node_cache = TreeCache(self.client, self.NODE_ROOT)
+                self._node_cache.listen_fault(self.cacheFaultListener)
+                self._node_cache.listen(self.nodeCacheListener)
+                self._node_cache.start()
+
+                self._request_cache = TreeCache(self.client, self.REQUEST_ROOT)
+                self._request_cache.listen_fault(self.cacheFaultListener)
+                self._request_cache.listen(self.requestCacheListener)
+                self._request_cache.start()
 
     def disconnect(self):
         '''
@@ -822,6 +955,15 @@ class ZooKeeper(object):
         You should call this method if you used connect() to establish a
         cluster connection.
         '''
+
+        if self._node_cache is not None:
+            self._node_cache.close()
+            self._node_cache = None
+
+        if self._request_cache is not None:
+            self._request_cache.close()
+            self._request_cache = None
+
         if self.client is not None and self.client.connected:
             self.client.stop()
             self.client.close()
@@ -1465,16 +1607,27 @@ class ZooKeeper(object):
         except kze.NoNodeError:
             pass
 
-    def getNodeRequest(self, request):
+    def getNodeRequest(self, request, cached=False):
         '''
         Get the data for a specific node request.
 
         :param str request: The request ID.
+        :param cached: True if cached node requests should be returned.
 
         :returns: The request data, or None if the request was not found.
         '''
-        path = self._requestPath(request)
+        if cached:
+            d = self._cached_node_requests.get(request)
+            if d:
+                return d
+
+        # If we got here we either didn't use the cache or the cache didn't
+        # have the request (yet). Note that even if we use caching we need to
+        # do a real query if the cached data is empty because the request data
+        # might not be in the cache yet when it's listed by the get_children
+        # call.
         try:
+            path = self._requestPath(request)
             data, stat = self.client.get(path)
         except kze.NoNodeError:
             return None
@@ -1482,6 +1635,24 @@ class ZooKeeper(object):
         d = NodeRequest.fromDict(self._bytesToDict(data), request)
         d.stat = stat
         return d
+
+    def updateNodeRequest(self, request):
+        '''
+        Update the data of a node request object in-place
+
+        :param request: the node request object to update
+        '''
+
+        path = self._requestPath(request.id)
+        data, stat = self.client.get(path)
+
+        if data:
+            d = self._bytesToDict(data)
+        else:
+            d = {}
+
+        request.updateFromDict(d)
+        request.stat = stat
 
     def storeNodeRequest(self, request, priority="100"):
         '''
@@ -1529,7 +1700,9 @@ class ZooKeeper(object):
         Lock a node request.
 
         This will set the `lock` attribute of the request object when the
-        lock is successfully acquired.
+        lock is successfully acquired. Also this will update the node request
+        with the latest data after acquiring the lock in order to guarantee
+        that it has the latest state if locking was successful.
 
         :param NodeRequest request: The request to lock.
         :param bool blocking: Whether or not to block on trying to
@@ -1559,6 +1732,9 @@ class ZooKeeper(object):
 
         request.lock = lock
 
+        # Do an in-place update of the node request so we have the latest data
+        self.updateNodeRequest(request)
+
     def unlockNodeRequest(self, request):
         '''
         Unlock a node request.
@@ -1580,7 +1756,9 @@ class ZooKeeper(object):
         Lock a node.
 
         This will set the `lock` attribute of the Node object when the
-        lock is successfully acquired.
+        lock is successfully acquired. Also this will update the node with the
+        latest data after acquiring the lock in order to guarantee that it has
+        the latest state if locking was successful.
 
         :param Node node: The node to lock.
         :param bool blocking: Whether or not to block on trying to
@@ -1610,6 +1788,9 @@ class ZooKeeper(object):
 
         node.lock = lock
 
+        # Do an in-place update of the node so we have the latest data.
+        self.updateNode(node)
+
     def unlockNode(self, node):
         '''
         Unlock a node.
@@ -1636,19 +1817,31 @@ class ZooKeeper(object):
         except kze.NoNodeError:
             return []
 
-    def getNode(self, node):
+    def getNode(self, node, cached=False):
         '''
         Get the data for a specific node.
 
         :param str node: The node ID.
+        :param bool cached: True if the data should be taken from the cache.
 
         :returns: The node data, or None if the node was not found.
         '''
-        path = self._nodePath(node)
+        if cached:
+            d = self._cached_nodes.get(node)
+            if d:
+                return d
+
+        # We got here we either didn't use the cache or the cache didn't
+        # have the node (yet). Note that even if we use caching we need to
+        # do a real query if the cached data is empty because the node data
+        # might not be in the cache yet when it's listed by the get_children
+        # call.
         try:
+            path = self._nodePath(node)
             data, stat = self.client.get(path)
         except kze.NoNodeError:
             return None
+
         if not data:
             return None
 
@@ -1656,6 +1849,25 @@ class ZooKeeper(object):
         d.id = node
         d.stat = stat
         return d
+
+    def updateNode(self, node):
+        '''
+        Update the data of a node object in-place
+
+        :param node: The node object
+        '''
+
+        path = self._nodePath(node.id)
+        data, stat = self.client.get(path)
+
+        if data:
+            d = self._bytesToDict(data)
+        else:
+            # The node exists but has no data so use empty dict.
+            d = {}
+
+        node.updateFromDict(d)
+        node.stat = stat
 
     def storeNode(self, node):
         '''
@@ -1688,6 +1900,41 @@ class ZooKeeper(object):
             path = self._nodePath(node.id)
             self.client.set(path, node.serialize())
 
+    def watchNode(self, node, callback):
+        '''Watch an existing node for changes.
+
+        :param Node node: The node object to watch.
+        :param callable callback: A callable object that will be invoked each
+            time the node is updated. It is called with two arguments (node,
+            deleted) where 'node' is the same argument passed to this method,
+            and 'deleted' is a boolean which is True if the node no longer
+            exists. The callback should return False when further updates are
+            no longer necessary.
+        '''
+        def _callback_wrapper(data, stat):
+            if data is not None:
+                node.updateFromDict(self._bytesToDict(data))
+
+            deleted = data is None
+            return callback(node, deleted)
+
+        path = self._nodePath(node.id)
+        self.client.DataWatch(path, _callback_wrapper)
+
+    def deleteRawNode(self, node_id):
+        '''
+        Delete a znode for a Node.
+
+        This is used to forcefully delete a Node znode that has somehow
+        ended up without any actual data. In most cases, you should be using
+        deleteNode() instead.
+        '''
+        path = self._nodePath(node_id)
+        try:
+            self.client.delete(path, recursive=True)
+        except kze.NoNodeError:
+            pass
+
     def deleteNode(self, node):
         '''
         Delete a node.
@@ -1698,27 +1945,34 @@ class ZooKeeper(object):
             return
 
         path = self._nodePath(node.id)
-        try:
-            self.client.delete(path, recursive=True)
-        except kze.NoNodeError:
-            pass
 
-    def getReadyNodesOfTypes(self, labels):
+        # Set the node state to deleted before we start deleting
+        # anything so that we can detect a race condition where the
+        # lock is removed before the node deletion occurs.
+        node.state = DELETED
+        self.client.set(path, node.serialize())
+        self.deleteRawNode(node.id)
+
+    def getReadyNodesOfTypes(self, labels, cached=True):
         '''
         Query ZooKeeper for unused/ready nodes.
 
         :param list labels: The node types we want.
 
         :returns: A dictionary, keyed by node type, with lists of Node objects
-            that are ready, or an empty dict if none are found.
+            that are ready, or an empty dict if none are found. A node may
+            appear more than once under different labels if it is tagged with
+            those labels.
         '''
         ret = {}
-        for node in self.nodeIterator():
-            if (node.state == READY and
-                    not node.allocated_to and node.type in labels):
-                if node.type not in ret:
-                    ret[node.type] = []
-                ret[node.type].append(node)
+        for node in self.nodeIterator(cached=cached):
+            if node.state != READY or node.allocated_to:
+                continue
+            for label in labels:
+                if label in node.type:
+                    if label not in ret:
+                        ret[label] = []
+                    ret[label].append(node)
         return ret
 
     def deleteOldestUnusedNode(self, provider_name, pool_name):
@@ -1765,8 +2019,7 @@ class ZooKeeper(object):
                 continue
 
             # Make sure the state didn't change on us
-            n = self.getNode(node.id)
-            if n.state != READY:
+            if node.state != READY:
                 self.unlockNode(node)
                 continue
 
@@ -1788,12 +2041,14 @@ class ZooKeeper(object):
 
         return False
 
-    def nodeIterator(self):
+    def nodeIterator(self, cached=True):
         '''
         Utility generator method for iterating through all nodes.
+
+        :param bool cached: True if the data should be taken from the cache.
         '''
         for node_id in self.getNodes():
-            node = self.getNode(node_id)
+            node = self.getNode(node_id, cached=cached)
             if node:
                 yield node
 
@@ -1806,12 +2061,12 @@ class ZooKeeper(object):
             if lock_stats:
                 yield lock_stats
 
-    def nodeRequestIterator(self):
+    def nodeRequestIterator(self, cached=True):
         '''
         Utility generator method for iterating through all nodes requests.
         '''
         for req_id in self.getNodeRequests():
-            req = self.getNodeRequest(req_id)
+            req = self.getNodeRequest(req_id, cached=cached)
             if req:
                 yield req
 
@@ -1885,3 +2140,133 @@ class ZooKeeper(object):
         '''
         for node in provider_nodes:
             self.deleteNode(node)
+
+    def cacheFaultListener(self, e):
+        self.log.exception(e)
+
+    def nodeCacheListener(self, event):
+        try:
+            self._nodeCacheListener(event)
+        except Exception:
+            self.log.exception("Exception in node cache update for event: %s",
+                               event)
+
+    def _nodeCacheListener(self, event):
+        if hasattr(event.event_data, 'path'):
+            # Ignore root node
+            path = event.event_data.path
+            if path == self.NODE_ROOT:
+                return
+
+            # Ignore lock nodes
+            if '/lock' in path:
+                return
+
+        # Ignore any non-node related events such as connection events here
+        if event.event_type not in (TreeEvent.NODE_ADDED,
+                                    TreeEvent.NODE_UPDATED,
+                                    TreeEvent.NODE_REMOVED):
+            return
+
+        path = event.event_data.path
+        node_id = path.rsplit('/', 1)[1]
+
+        if event.event_type in (TreeEvent.NODE_ADDED, TreeEvent.NODE_UPDATED):
+            # Nodes with empty data are invalid so skip add or update these.
+            if not event.event_data.data:
+                return
+
+            # Perform an in-place update of the already cached node if possible
+            d = self._bytesToDict(event.event_data.data)
+            old_node = self._cached_nodes.get(node_id)
+            if old_node:
+                if event.event_data.stat.version <= old_node.stat.version:
+                    # Don't update to older data
+                    return
+                if old_node.lock:
+                    # Don't update a locked node
+                    return
+                old_node.updateFromDict(d)
+                old_node.stat = event.event_data.stat
+            else:
+                node = Node.fromDict(d, node_id)
+                node.stat = event.event_data.stat
+                self._cached_nodes[node_id] = node
+
+            # set the stats event so the stats reporting thread can act upon it
+            if self.node_stats_event is not None:
+                self.node_stats_event.set()
+        elif event.event_type == TreeEvent.NODE_REMOVED:
+            try:
+                del self._cached_nodes[node_id]
+            except KeyError:
+                # If it's already gone, don't care
+                pass
+
+            # set the stats event so the stats reporting thread can act upon it
+            if self.node_stats_event is not None:
+                self.node_stats_event.set()
+
+    def setNodeStatsEvent(self, event):
+        self.node_stats_event = event
+
+    def requestCacheListener(self, event):
+        try:
+            self._requestCacheListener(event)
+        except Exception:
+            self.log.exception(
+                "Exception in request cache update for event: %s",
+                event)
+
+    def _requestCacheListener(self, event):
+        if hasattr(event.event_data, 'path'):
+            # Ignore root node
+            path = event.event_data.path
+            if path == self.REQUEST_ROOT:
+                return
+
+            # Ignore lock nodes
+            if '/lock' in path:
+                return
+
+        # Ignore any non-node related events such as connection events here
+        if event.event_type not in (TreeEvent.NODE_ADDED,
+                                    TreeEvent.NODE_UPDATED,
+                                    TreeEvent.NODE_REMOVED):
+            return
+
+        path = event.event_data.path
+        request_id = path.rsplit('/', 1)[1]
+
+        if event.event_type in (TreeEvent.NODE_ADDED, TreeEvent.NODE_UPDATED):
+            # Requests with empty data are invalid so skip add or update these.
+            if not event.event_data.data:
+                return
+
+            # Perform an in-place update of the cached request if possible
+            d = self._bytesToDict(event.event_data.data)
+            old_request = self._cached_node_requests.get(request_id)
+            if old_request:
+                if event.event_data.stat.version <= old_request.stat.version:
+                    # Don't update to older data
+                    return
+                if old_request.lock:
+                    # Don't update a locked node request
+                    return
+                old_request.updateFromDict(d)
+                old_request.stat = event.event_data.stat
+            else:
+                request = NodeRequest.fromDict(d, request_id)
+                request.stat = event.event_data.stat
+                self._cached_node_requests[request_id] = request
+
+        elif event.event_type == TreeEvent.NODE_REMOVED:
+            try:
+                del self._cached_node_requests[request_id]
+            except KeyError:
+                # If it's already gone, don't care
+                pass
+
+    def getStatsElection(self, identifier):
+        path = self._electionPath('stats')
+        return Election(self.client, path, identifier)

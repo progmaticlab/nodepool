@@ -16,54 +16,87 @@
 
 import voluptuous as v
 
-from nodepool.driver import ConfigValue
+from nodepool.driver import ConfigPool
 from nodepool.driver import ProviderConfig
 from nodepool.config import as_list
 
 
-class StaticPool(ConfigValue):
+class StaticPool(ConfigPool):
+    def __init__(self):
+        self.name = None
+        self.nodes = []
+        # The StaticProviderConfig that owns this pool.
+        self.provider = None
+
+        # Initialize base class attributes
+        super().__init__()
+
     def __eq__(self, other):
-        if (other.labels != self.labels or
-            other.nodes != self.nodes):
-            return False
-        return True
+        if isinstance(other, StaticPool):
+            return (super().__eq__(other) and
+                    other.name == self.name and
+                    other.nodes == self.nodes)
+        return False
 
     def __repr__(self):
         return "<StaticPool %s>" % self.name
 
+    def load(self, pool_config, full_config):
+        super().load(pool_config)
+        self.name = pool_config['name']
+        # WARNING: This intentionally changes the type!
+        self.labels = set()
+        for node in pool_config.get('nodes', []):
+            self.nodes.append({
+                'name': node['name'],
+                'labels': as_list(node['labels']),
+                'host-key': as_list(node.get('host-key', [])),
+                'host-key-checking': bool(node.get('host-key-checking', True)),
+                'timeout': int(node.get('timeout', 5)),
+                # Read ssh-port values for backward compat, but prefer port
+                'connection-port': int(
+                    node.get('connection-port', node.get('ssh-port', 22))),
+                'connection-type': node.get('connection-type', 'ssh'),
+                'username': node.get('username', 'zuul'),
+                'max-parallel-jobs': int(node.get('max-parallel-jobs', 1)),
+                'python-path': node.get('python-path', '/usr/bin/python2'),
+            })
+            if isinstance(node['labels'], str):
+                for label in node['labels'].split():
+                    self.labels.add(label)
+                    full_config.labels[label].pools.append(self)
+            elif isinstance(node['labels'], list):
+                for label in node['labels']:
+                    self.labels.add(label)
+                    full_config.labels[label].pools.append(self)
+
 
 class StaticProviderConfig(ProviderConfig):
-    def __eq__(self, other):
-        if other.pools != self.pools:
-            return False
-        return True
+    def __init__(self, *args, **kwargs):
+        self.__pools = {}
+        super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def reset():
-        pass
+    def __eq__(self, other):
+        if isinstance(other, StaticProviderConfig):
+            return (super().__eq__(other) and
+                    other.manage_images == self.manage_images and
+                    other.pools == self.pools)
+        return False
+
+    @property
+    def pools(self):
+        return self.__pools
+
+    @property
+    def manage_images(self):
+        return False
 
     def load(self, config):
-        self.pools = {}
         for pool in self.provider.get('pools', []):
             pp = StaticPool()
-            pp.name = pool['name']
+            pp.load(pool, config)
             pp.provider = self
             self.pools[pp.name] = pp
-            pp.labels = set()
-            pp.nodes = []
-            for node in pool.get('nodes', []):
-                pp.nodes.append({
-                    'name': node['name'],
-                    'labels': as_list(node['labels']),
-                    'host-key': as_list(node.get('host-key', [])),
-                    'timeout': int(node.get('timeout', 5)),
-                    'ssh-port': int(node.get('ssh-port', 22)),
-                    'username': node.get('username', 'zuul'),
-                    'max-parallel-jobs': int(node.get('max-parallel-jobs', 1)),
-                })
-                for label in node['labels'].split():
-                    pp.labels.add(label)
-                    config.labels[label].pools.append(pp)
 
     def getSchema(self):
         pool_node = {
@@ -71,18 +104,25 @@ class StaticProviderConfig(ProviderConfig):
             v.Required('labels'): v.Any(str, [str]),
             'username': str,
             'timeout': int,
+            'host-key-checking': bool,
             'host-key': v.Any(str, [str]),
-            'ssh-port': int,
+            'connection-port': int,
+            'connection-type': str,
             'max-parallel-jobs': int,
+            'python-path': str,
         }
-        pool = {
+        pool = ConfigPool.getCommonSchemaDict()
+        pool.update({
             'name': str,
             'nodes': [pool_node],
-        }
-        return v.Schema({'pools': [pool]})
+        })
+        schema = ProviderConfig.getCommonSchemaDict()
+        schema.update({'pools': [pool]})
+        return v.Schema(schema)
 
-    def getSupportedLabels(self):
+    def getSupportedLabels(self, pool_name=None):
         labels = set()
         for pool in self.pools.values():
-            labels.update(pool.labels)
+            if not pool_name or (pool.name == pool_name):
+                labels.update(pool.labels)
         return labels

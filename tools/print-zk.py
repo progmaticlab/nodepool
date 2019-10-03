@@ -30,8 +30,8 @@ args = parser.parse_args()
 
 config = nodepool.config.loadConfig(args.config)
 
-zk = nodepool.zk.ZooKeeper()
-zk.connect(config.zookeeper_servers.values())
+zk = nodepool.zk.ZooKeeper(enable_cache=False)
+zk.connect(list(config.zookeeper_servers.values()))
 
 def join(a, b):
     if a.endswith('/'):
@@ -40,12 +40,12 @@ def join(a, b):
 
 def print_tree(node):
     data, stat = zk.client.get(node)
-    print "Node: %s %s" % (node, stat)
+    print("Node: %s %s" % (node, stat))
     if data:
-        print data
+        print(data)
 
     for child in zk.client.get_children(node):
-        print
+        print()
         print_tree(join(node, child))
 
 print_tree('/')

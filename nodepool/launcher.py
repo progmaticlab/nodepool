@@ -24,12 +24,13 @@ import socket
 import threading
 import time
 
+from kazoo import exceptions as kze
+
 from nodepool import exceptions
 from nodepool import provider_manager
 from nodepool import stats
 from nodepool import config as nodepool_config
 from nodepool import zk
-from nodepool.driver import Drivers
 
 
 MINS = 60
@@ -45,13 +46,12 @@ LOCK_CLEANUP = 8 * HOURS
 SUSPEND_WAIT_TIME = 30
 
 
-class NodeDeleter(threading.Thread, stats.StatsReporter):
+class NodeDeleter(threading.Thread):
     log = logging.getLogger("nodepool.NodeDeleter")
 
     def __init__(self, zk, provider_manager, node):
         threading.Thread.__init__(self, name='NodeDeleter for %s %s' %
                                   (node.provider, node.external_id))
-        stats.StatsReporter.__init__(self)
         self._zk = zk
         self._provider_manager = provider_manager
         self._node = node
@@ -96,6 +96,7 @@ class NodeDeleter(threading.Thread, stats.StatsReporter):
                 node.id, node.state, node.external_id)
             # This also effectively releases the lock
             zk_conn.deleteNode(node)
+            manager.nodeDeletedNotification(node)
 
     def run(self):
         # Since leaked instances won't have an actual node in ZooKeeper,
@@ -105,15 +106,14 @@ class NodeDeleter(threading.Thread, stats.StatsReporter):
         else:
             node_exists = True
 
-        self.delete(self._zk, self._provider_manager, self._node, node_exists)
-
         try:
-            self.updateNodeStats(self._zk, self._provider_manager.provider)
+            self.delete(self._zk, self._provider_manager,
+                        self._node, node_exists)
         except Exception:
-            self.log.exception("Exception while reporting stats:")
+            self.log.exception("Error deleting node %s:", self._node)
 
 
-class PoolWorker(threading.Thread):
+class PoolWorker(threading.Thread, stats.StatsReporter):
     '''
     Class that manages node requests for a single provider pool.
 
@@ -141,34 +141,54 @@ class PoolWorker(threading.Thread):
         self.launcher_id = "%s-%s-%s" % (socket.gethostname(),
                                          os.getpid(),
                                          self.name)
+        stats.StatsReporter.__init__(self)
 
     # ---------------------------------------------------------------
     # Private methods
     # ---------------------------------------------------------------
 
-    def _get_node_request_handler(self, provider, request):
-        driver = Drivers.get(provider.driver.name)
-        return driver['handler'](self, request)
-
-    def _assignHandlers(self):
+    def _assignHandlers(self, timeout=15):
         '''
         For each request we can grab, create a NodeRequestHandler for it.
 
         The NodeRequestHandler object will kick off any threads needed to
         satisfy the request, then return. We will need to periodically poll
         the handler for completion.
+
+        If exceeds the timeout it stops further iteration and returns False
+        in order to give us time to call _removeCompletedHandlers. Otherwise
+        it returns True to signal that it is finished for now.
         '''
+        start = time.monotonic()
         provider = self.getProviderConfig()
         if not provider:
             self.log.info("Missing config. Deleted provider?")
-            return
+            return True
 
         if provider.max_concurrency == 0:
-            return
+            return True
 
-        for req_id in self.zk.getNodeRequests():
+        # Get the launchers which are currently online.  This may
+        # become out of date as the loop progresses, but it should be
+        # good enough to determine whether we should process requests
+        # which express a preference for a specific provider.
+        launchers = self.zk.getRegisteredLaunchers()
+
+        # Sort requests by queue priority, then, for all requests at
+        # the same priority, use the relative_priority field to
+        # further sort, then finally, the submission order.
+        requests = list(self.zk.nodeRequestIterator())
+        requests.sort(key=lambda r: (r.id.split('-')[0],
+                                     r.relative_priority,
+                                     r.id.split('-')[1]))
+
+        for req in requests:
+            if not self.running:
+                return True
+
             if self.paused_handler:
-                return
+                self.log.debug("Handler is now paused")
+                return True
 
             # Get active threads for all pools for this provider
             active_threads = sum([
@@ -182,9 +202,9 @@ class PoolWorker(threading.Thread):
                 self.log.debug("Request handling limited: %s active threads ",
                                "with max concurrency of %s",
                                active_threads, provider.max_concurrency)
-                return
+                return True
 
-            req = self.zk.getNodeRequest(req_id)
+            req = self.zk.getNodeRequest(req.id)
             if not req:
                 continue
 
@@ -196,24 +216,49 @@ class PoolWorker(threading.Thread):
             if self.launcher_id in req.declined_by:
                 continue
 
+            # Skip this request if it is requesting another provider
+            # which is online
+            if req.provider and req.provider != self.provider_name:
+                # The request is asking for a specific provider
+                candidate_launchers = set(
+                    [x.id for x in launchers
+                     if x.provider_name == req.provider])
+                if candidate_launchers:
+                    # There is a launcher online which can satisfy the request
+                    if not candidate_launchers.issubset(set(req.declined_by)):
+                        # It has not yet declined the request, so yield to it.
+                        self.log.debug(
+                            "Yielding request %s to provider %s %s",
+                            req.id, req.provider, candidate_launchers)
+                        continue
+
+            self.log.debug("Locking request %s", req.id)
             try:
                 self.zk.lockNodeRequest(req, blocking=False)
             except exceptions.ZKLockException:
+                self.log.debug("Request %s is locked by someone else", req.id)
                 continue
 
             # Make sure the state didn't change on us after getting the lock
-            req2 = self.zk.getNodeRequest(req_id)
-            if req2 and req2.state != zk.REQUESTED:
+            if req.state != zk.REQUESTED:
                 self.zk.unlockNodeRequest(req)
+                self.log.debug("Request %s is in state %s", req.id, req.state)
                 continue
 
             # Got a lock, so assign it
             self.log.info("Assigning node request %s" % req)
-            rh = self._get_node_request_handler(provider, req)
+
+            pm = self.getProviderManager()
+            rh = pm.getRequestHandler(self, req)
             rh.run()
             if rh.paused:
                 self.paused_handler = rh
             self.request_handlers.append(rh)
+
+            # if we exceeded the timeout stop iterating here
+            if time.monotonic() - start > timeout:
+                return False
+        return True
 
     def _removeCompletedHandlers(self):
         '''
@@ -224,9 +269,15 @@ class PoolWorker(threading.Thread):
             try:
                 if not r.poll():
                     active_handlers.append(r)
+                    if r.paused:
+                        self.paused_handler = r
                 else:
                     self.log.debug("Removing handler for request %s",
                                    r.request.id)
+            except kze.SessionExpiredError:
+                # If we lost our ZooKeeper session, we've lost our NodeRequest
+                # lock so it's no longer active
+                continue
             except Exception:
                 # If we fail to poll a request handler log it but move on
                 # and process the other handlers. We keep this handler around
@@ -289,14 +340,23 @@ class PoolWorker(threading.Thread):
             launcher.id = self.launcher_id
             for prov_cfg in self.nodepool.config.providers.values():
                 launcher.supported_labels.update(prov_cfg.getSupportedLabels())
+            launcher.provider_name = self.provider_name
             self.zk.registerLauncher(launcher)
+
+            self.updateProviderLimits(
+                self.nodepool.config.providers.get(self.provider_name))
 
             try:
                 if not self.paused_handler:
-                    self._assignHandlers()
+                    while not self._assignHandlers():
+                        # _assignHandlers can take quite some time on a busy
+                        # system so sprinkle _removeCompletedHandlers in
+                        # between such that we have a chance to fulfill
+                        # requests that already have all nodes.
+                        self._removeCompletedHandlers()
                 else:
                     # If we are paused, one request handler could not
-                    # satisify its assigned request, so give it
+                    # satisfy its assigned request, so give it
                     # another shot. Unpause ourselves if it completed.
                     self.paused_handler.run()
                     if not self.paused_handler.paused:
@@ -371,6 +431,8 @@ class CleanupWorker(BaseCleanupWorker):
             (self._cleanupLeakedInstances, 'leaked instance cleanup'),
             (self._cleanupLostRequests, 'lost request cleanup'),
             (self._cleanupMaxReadyAge, 'max ready age cleanup'),
+            (self._cleanupMaxHoldAge, 'max hold age cleanup'),
+            (self._cleanupEmptyNodes, 'empty node cleanup'),
         ]
 
     def _resetLostRequest(self, zk_conn, req):
@@ -460,42 +522,17 @@ class CleanupWorker(BaseCleanupWorker):
 
     def _cleanupLeakedInstances(self):
         '''
-        Delete any leaked server instances.
-
-        Remove any servers we find in providers we know about that are not
-        recorded in the ZooKeeper data.
+        Allow each provider manager a chance to cleanup resources.
         '''
-        zk_conn = self._nodepool.getZK()
-
         for provider in self._nodepool.config.providers.values():
             manager = self._nodepool.getProviderManager(provider.name)
-
-            for server in manager.listNodes():
-                meta = server.get('metadata', {})
-
-                if 'nodepool_provider_name' not in meta:
-                    continue
-
-                if meta['nodepool_provider_name'] != provider.name:
-                    # Another launcher, sharing this provider but configured
-                    # with a different name, owns this.
-                    continue
-
-                if not zk_conn.getNode(meta['nodepool_node_id']):
-                    self.log.warning(
-                        "Marking for delete leaked instance %s (%s) in %s "
-                        "(unknown node id %s)",
-                        server.name, server.id, provider.name,
-                        meta['nodepool_node_id']
-                    )
-                    # Create an artifical node to use for deleting the server.
-                    node = zk.Node()
-                    node.external_id = server.id
-                    node.provider = provider.name
-                    node.state = zk.DELETING
-                    zk_conn.storeNode(node)
-
-            manager.cleanupLeakedResources()
+            if manager:
+                try:
+                    manager.cleanupLeakedResources()
+                except Exception:
+                    self.log.exception(
+                        "Failure during resource cleanup for provider %s",
+                        provider.name)
 
     def _cleanupMaxReadyAge(self):
         '''
@@ -608,6 +645,21 @@ class CleanupWorker(BaseCleanupWorker):
             finally:
                 zk_conn.unlockNode(node)
 
+    def _cleanupEmptyNodes(self):
+        '''
+        Remove any Node znodes that may be totally empty.
+        '''
+        self.log.debug('Cleaning up empty nodes...')
+        zk_conn = self._nodepool.getZK()
+
+        # We cannot use nodeIterator() here since that does not yield us
+        # empty nodes.
+        for node_id in zk_conn.getNodes():
+            node = zk_conn.getNode(node_id)
+            if node is None:
+                self.log.debug("Removing empty node %s", node_id)
+                zk_conn.deleteRawNode(node_id)
+
     def _run(self):
         '''
         Catch exceptions individually so that other cleanup routines may
@@ -619,12 +671,6 @@ class CleanupWorker(BaseCleanupWorker):
             except Exception:
                 self.log.exception(
                     "Exception in %s (%s)", self.name, description)
-
-        try:
-            self._cleanupMaxHoldAge()
-        except Exception:
-            self.log.exception(
-                "Exception in CleanupWorker (max hold age cleanup):")
 
 
 class DeletedNodeWorker(BaseCleanupWorker):
@@ -663,7 +709,7 @@ class DeletedNodeWorker(BaseCleanupWorker):
         Delete instances from providers and nodes entries from ZooKeeper.
         '''
         cleanup_states = (zk.USED, zk.IN_USE, zk.BUILDING, zk.FAILED,
-                          zk.DELETING)
+                          zk.DELETING, zk.DELETED, zk.ABORTED)
 
         zk_conn = self._nodepool.getZK()
         for node in zk_conn.nodeIterator():
@@ -702,6 +748,27 @@ class DeletedNodeWorker(BaseCleanupWorker):
                 except exceptions.ZKLockException:
                     continue
 
+                if (node.state == zk.DELETED or
+                    node.provider is None):
+                    # The node has been deleted out from under us --
+                    # we only obtained the lock because in the
+                    # recursive delete, the lock is deleted first and
+                    # we locked the node between the time of the lock
+                    # delete and the node delete.  We need to clean up
+                    # the mess.
+                    try:
+                        # This should delete the lock as well
+                        zk_conn.deleteNode(node)
+                    except Exception:
+                        self.log.exception(
+                            "Error deleting already deleted znode:")
+                        try:
+                            zk_conn.unlockNode(node)
+                        except Exception:
+                            self.log.exception(
+                                "Error unlocking already deleted znode:")
+                    continue
+
                 # Double check the state now that we have a lock since it
                 # may have changed on us.
                 if node.state not in cleanup_states:
@@ -730,6 +797,69 @@ class DeletedNodeWorker(BaseCleanupWorker):
             self.log.exception("Exception in DeletedNodeWorker:")
 
 
+class StatsWorker(BaseCleanupWorker, stats.StatsReporter):
+
+    def __init__(self, nodepool, interval):
+        super().__init__(nodepool, interval, name='StatsWorker')
+        self.log = logging.getLogger('nodepool.StatsWorker')
+        self.stats_event = threading.Event()
+        self.election = None
+
+    def stop(self):
+        self._running = False
+        if self.election is not None:
+            self.log.debug('Cancel leader election')
+            self.election.cancel()
+        self.stats_event.set()
+        super().stop()
+
+    def _run(self):
+        try:
+            stats.StatsReporter.__init__(self)
+
+            if not self._statsd:
+                return
+
+            if self.election is None:
+                zk = self._nodepool.getZK()
+                identifier = "%s-%s" % (socket.gethostname(), os.getpid())
+                self.election = zk.getStatsElection(identifier)
+
+            if not self._running:
+                return
+
+            self.election.run(self._run_stats)
+
+        except Exception:
+            self.log.exception('Exception in StatsWorker:')
+
+    def _run_stats(self):
+        self.log.info('Won stats reporter election')
+
+        # enable us getting events
+        zk = self._nodepool.getZK()
+        zk.setNodeStatsEvent(self.stats_event)
+
+        while self._running:
+            signaled = self.stats_event.wait()
+
+            if not self._running:
+                break
+
+            if not signaled:
+                continue
+
+            self.stats_event.clear()
+            try:
+                self.updateNodeStats(zk)
+            except Exception:
+                self.log.exception("Exception while reporting stats:")
+            time.sleep(1)
+
+        # Unregister from node stats events
+        zk.setNodeStatsEvent(None)
+
+
 class NodePool(threading.Thread):
     log = logging.getLogger("nodepool.NodePool")
 
@@ -741,6 +871,7 @@ class NodePool(threading.Thread):
         self.watermark_sleep = watermark_sleep
         self.cleanup_interval = 60
         self.delete_interval = 5
+        self.stats_interval = 5
         self._stopped = False
         self._stop_event = threading.Event()
         self.config = None
@@ -749,6 +880,7 @@ class NodePool(threading.Thread):
         self._pool_threads = {}
         self._cleanup_thread = None
         self._delete_thread = None
+        self._stats_thread = None
         self._submittedRequests = {}
 
     def stop(self):
@@ -768,6 +900,10 @@ class NodePool(threading.Thread):
         if self._delete_thread:
             self._delete_thread.stop()
             self._delete_thread.join()
+
+        if self._stats_thread:
+            self._stats_thread.stop()
+            self._stats_thread.join()
 
         # Don't let stop() return until all pool threads have been
         # terminated.
@@ -813,7 +949,7 @@ class NodePool(threading.Thread):
         return self.zk
 
     def getProviderManager(self, provider_name):
-        return self.config.provider_managers[provider_name]
+        return self.config.provider_managers.get(provider_name)
 
     def getPoolWorkers(self, provider_name):
         return [t for t in self._pool_threads.values() if
@@ -821,8 +957,9 @@ class NodePool(threading.Thread):
 
     def updateConfig(self):
         config = self.loadConfig()
-        provider_manager.ProviderManager.reconfigure(self.config, config)
         self.reconfigureZooKeeper(config)
+        provider_manager.ProviderManager.reconfigure(self.config, config,
+                                                     self.getZK())
         self.setConfig(config)
 
     def removeCompletedRequests(self):
@@ -881,7 +1018,7 @@ class NodePool(threading.Thread):
             ready in at least one provider. False otherwise.
         '''
         for pool in label.pools:
-            if not pool.provider.driver.manage_images:
+            if not pool.provider.manage_images:
                 # Provider doesn't manage images, assuming label is ready
                 return True
             for pool_label in pool.labels.values():
@@ -923,7 +1060,9 @@ class NodePool(threading.Thread):
         requested_labels = list(self._submittedRequests.keys())
         needed_labels = list(set(label_names) - set(requested_labels))
 
-        ready_nodes = self.zk.getReadyNodesOfTypes(needed_labels)
+        # Note we explicitly don't use the cache here because otherwise we can
+        # end up creating more min-ready nodes than we want.
+        ready_nodes = self.zk.getReadyNodesOfTypes(needed_labels, cached=False)
 
         for label in self.config.labels.values():
             if label.name not in needed_labels:
@@ -977,6 +1116,10 @@ class NodePool(threading.Thread):
                     self._delete_thread = DeletedNodeWorker(
                         self, self.delete_interval)
                     self._delete_thread.start()
+
+                if not self._stats_thread:
+                    self._stats_thread = StatsWorker(self, self.stats_interval)
+                    self._stats_thread.start()
 
                 # Stop any PoolWorker threads if the pool was removed
                 # from the config.

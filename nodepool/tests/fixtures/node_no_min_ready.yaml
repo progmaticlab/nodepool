@@ -10,6 +10,8 @@ zookeeper-servers:
 labels:
   - name: fake-label
     min-ready: 0
+  - name: fake-label2
+    min-ready: 0
 
 providers:
   - name: fake-provider
@@ -34,6 +36,10 @@ providers:
             diskimage: fake-image
             min-ram: 8192
             flavor-name: 'Fake'
+          - name: fake-label2
+            diskimage: fake-image
+            min-ram: 8192
+            flavor-name: 'Fake'
 
 diskimages:
   - name: fake-image
@@ -41,6 +47,7 @@ diskimages:
       - fedora
       - vm
     release: 21
+    python-path: /usr/bin/python3
     env-vars:
       TMPDIR: /opt/dib_tmp
       DIB_IMAGE_CACHE: /opt/dib_cache

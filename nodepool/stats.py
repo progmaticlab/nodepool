@@ -51,61 +51,72 @@ class StatsReporter(object):
         super(StatsReporter, self).__init__()
         self._statsd = get_client()
 
-    def recordLaunchStats(self, subkey, dt, image_name,
-                          provider_name, node_az, requestor):
+    def recordLaunchStats(self, subkey, dt):
         '''
         Record node launch statistics.
 
         :param str subkey: statsd key
         :param int dt: Time delta in milliseconds
-        :param str image_name: Name of the image used
-        :param str provider_name: Name of the provider
-        :param str node_az: AZ of the launched node
-        :param str requestor: Identifier for the request originator
         '''
         if not self._statsd:
             return
 
         keys = [
-            'nodepool.launch.provider.%s.%s' % (provider_name, subkey),
-            'nodepool.launch.image.%s.%s' % (image_name, subkey),
+            'nodepool.launch.provider.%s.%s' % (
+                self.provider_config.name, subkey),
             'nodepool.launch.%s' % (subkey,),
         ]
 
-        if node_az:
+        if self.node.az:
             keys.append('nodepool.launch.provider.%s.%s.%s' %
-                        (provider_name, node_az, subkey))
+                        (self.provider_config.name, self.node.az, subkey))
 
-        if requestor:
+        if self.handler.request.requestor:
             # Replace '.' which is a graphite hierarchy, and ':' which is
             # a statsd delimeter.
-            requestor = requestor.replace('.', '_')
+            requestor = self.handler.request.requestor.replace('.', '_')
             requestor = requestor.replace(':', '_')
             keys.append('nodepool.launch.requestor.%s.%s' %
                         (requestor, subkey))
 
+        pipeline = self._statsd.pipeline()
         for key in keys:
-            self._statsd.timing(key, dt)
-            self._statsd.incr(key)
+            pipeline.timing(key, dt)
+            pipeline.incr(key)
+        pipeline.send()
 
-    def updateNodeStats(self, zk_conn, provider):
+    def updateNodeStats(self, zk_conn):
         '''
         Refresh statistics for all known nodes.
 
         :param ZooKeeper zk_conn: A ZooKeeper connection object.
-        :param Provider provider: A config Provider object.
         '''
         if not self._statsd:
             return
 
         states = {}
 
+        launchers = zk_conn.getRegisteredLaunchers()
+        labels = set()
+        for launcher in launchers:
+            labels.update(launcher.supported_labels)
+        providers = set()
+        for launcher in launchers:
+            providers.add(launcher.provider_name)
+
         # Initialize things we know about to zero
         for state in zk.Node.VALID_STATES:
             key = 'nodepool.nodes.%s' % state
             states[key] = 0
-            key = 'nodepool.provider.%s.nodes.%s' % (provider.name, state)
-            states[key] = 0
+            for provider in providers:
+                key = 'nodepool.provider.%s.nodes.%s' % (provider, state)
+                states[key] = 0
+
+        # Initialize label stats to 0
+        for label in labels:
+            for state in zk.Node.VALID_STATES:
+                key = 'nodepool.label.%s.nodes.%s' % (label, state)
+                states[key] = 0
 
         for node in zk_conn.nodeIterator():
             # nodepool.nodes.STATE
@@ -113,12 +124,15 @@ class StatsReporter(object):
             states[key] += 1
 
             # nodepool.label.LABEL.nodes.STATE
-            key = 'nodepool.label.%s.nodes.%s' % (node.type, node.state)
-            # It's possible we could see node types that aren't in our config
-            if key in states:
-                states[key] += 1
-            else:
-                states[key] = 1
+            # nodes can have several labels
+            for label in node.type:
+                key = 'nodepool.label.%s.nodes.%s' % (label, node.state)
+                # It's possible we could see node types that aren't in our
+                # config
+                if key in states:
+                    states[key] += 1
+                else:
+                    states[key] = 1
 
             # nodepool.provider.PROVIDER.nodes.STATE
             key = 'nodepool.provider.%s.nodes.%s' % (node.provider, node.state)
@@ -128,11 +142,22 @@ class StatsReporter(object):
             else:
                 states[key] = 1
 
+        pipeline = self._statsd.pipeline()
         for key, count in states.items():
-            self._statsd.gauge(key, count)
+            pipeline.gauge(key, count)
+
+        pipeline.send()
+
+    def updateProviderLimits(self, provider):
+        if not self._statsd:
+            return
+
+        pipeline = self._statsd.pipeline()
 
         # nodepool.provider.PROVIDER.max_servers
         key = 'nodepool.provider.%s.max_servers' % provider.name
         max_servers = sum([p.max_servers for p in provider.pools.values()
                            if p.max_servers])
-        self._statsd.gauge(key, max_servers)
+        pipeline.gauge(key, max_servers)
+
+        pipeline.send()

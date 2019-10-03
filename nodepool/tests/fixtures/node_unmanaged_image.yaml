@@ -12,6 +12,8 @@ labels:
     min-ready: 1
   - name: fake-label-windows
     min-ready: 1
+  - name: fake-label-arbitrary-port
+    min-ready: 1
 
 providers:
   - name: fake-provider
@@ -21,9 +23,14 @@ providers:
     rate: 0.0001
     cloud-images:
       - name: fake-image
+        python-path: /usr/bin/python3
       - name: fake-image-windows
         username: zuul
         connection-type: winrm
+      - name: fake-image-windows-port
+        username: zuul
+        connection-type: winrm
+        connection-port: 1234
     pools:
       - name: main
         max-servers: 96
@@ -33,4 +40,7 @@ providers:
             min-ram: 8192
           - name: fake-label-windows
             cloud-image: fake-image-windows
+            min-ram: 8192
+          - name: fake-label-arbitrary-port
+            cloud-image: fake-image-windows-port
             min-ram: 8192

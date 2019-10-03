@@ -119,6 +119,7 @@ def node_list(zk, node_id=None):
         ("state", "State"),
         ("age", "Age"),
         ("locked", "Locked"),
+        ("pool", "Pool"),
         ("hostname", "Hostname"),
         ("private_ipv4", "Private IPv4"),
         ("AZ", "AZ"),
@@ -149,6 +150,7 @@ def node_list(zk, node_id=None):
             node.state,
             age(node.state_time),
             locked,
+            node.pool,
             node.hostname,
             node.private_ipv4,
             node.az,
@@ -230,6 +232,7 @@ def image_list(zk):
 def request_list(zk):
     headers_table = OrderedDict([
         ("id", "Request ID"),
+        ("relative_priority", "Priority"),
         ("state", "State"),
         ("requestor", "Requestor"),
         ("node_types", "Node Types"),
@@ -237,7 +240,8 @@ def request_list(zk):
         ("declined_by", "Declined By")])
     objs = []
     for req in zk.nodeRequestIterator():
-        values = [req.id, req.state, req.requestor,
+        values = [req.id, req.relative_priority,
+                  req.state, req.requestor,
                   req.node_types,
                   req.nodes,
                   req.declined_by]

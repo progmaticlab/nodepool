@@ -16,120 +16,61 @@
 
 import copy
 import logging
-import math
 import operator
+import os
 import time
 
-import shade
+import openstack
 
 from nodepool import exceptions
 from nodepool.driver import Provider
+from nodepool.driver.utils import QuotaInformation
 from nodepool.nodeutils import iterate_timeout
-from nodepool.task_manager import ManagerStoppedException
-from nodepool.task_manager import TaskManager
+from nodepool import stats
 from nodepool import version
+from nodepool import zk
+
+# Import entire module to avoid partial-loading, circular import
+from nodepool.driver.openstack import handler
 
 
 IPS_LIST_AGE = 5      # How long to keep a cached copy of the ip list
 MAX_QUOTA_AGE = 5 * 60  # How long to keep the quota information cached
 
 
-class QuotaInformation:
-
-    def __init__(self, cores=None, instances=None, ram=None, default=0):
-        '''
-        Initializes the quota information with some values. None values will
-        be initialized with default which will be typically 0 or math.inf
-        indicating an infinite limit.
-
-        :param cores:
-        :param instances:
-        :param ram:
-        :param default:
-        '''
-        self.quota = {
-            'compute': {
-                'cores': self._get_default(cores, default),
-                'instances': self._get_default(instances, default),
-                'ram': self._get_default(ram, default),
-            }
-        }
-
-    @staticmethod
-    def construct_from_flavor(flavor):
-        return QuotaInformation(instances=1,
-                                cores=flavor.vcpus,
-                                ram=flavor.ram)
-
-    @staticmethod
-    def construct_from_limits(limits):
-        def bound_value(value):
-            if value == -1:
-                return math.inf
-            return value
-
-        return QuotaInformation(
-            instances=bound_value(limits.max_total_instances),
-            cores=bound_value(limits.max_total_cores),
-            ram=bound_value(limits.max_total_ram_size))
-
-    def _get_default(self, value, default):
-        return value if value is not None else default
-
-    def _add_subtract(self, other, add=True):
-        for category in self.quota.keys():
-            for resource in self.quota[category].keys():
-                second_value = other.quota.get(category, {}).get(resource, 0)
-                if add:
-                    self.quota[category][resource] += second_value
-                else:
-                    self.quota[category][resource] -= second_value
-
-    def subtract(self, other):
-        self._add_subtract(other, add=False)
-
-    def add(self, other):
-        self._add_subtract(other, True)
-
-    def non_negative(self):
-        for key_i, category in self.quota.items():
-            for resource, value in category.items():
-                if value < 0:
-                    return False
-        return True
-
-    def __str__(self):
-        return str(self.quota)
-
-
 class OpenStackProvider(Provider):
     log = logging.getLogger("nodepool.driver.openstack.OpenStackProvider")
 
-    def __init__(self, provider, use_taskmanager):
+    def __init__(self, provider):
         self.provider = provider
         self._images = {}
         self._networks = {}
-        self.__flavors = {}
+        self.__flavors = {}  # TODO(gtema): caching
         self.__azs = None
-        self._use_taskmanager = use_taskmanager
-        self._taskmanager = None
         self._current_nodepool_quota = None
+        self._zk = None
+        self._down_ports = set()
+        self._last_port_cleanup = None
+        # Set this long enough to avoid deleting a port which simply
+        # hasn't yet been attached to an instance which is being
+        # created.
+        self._port_cleanup_interval_secs = 600
+        self._statsd = stats.get_client()
 
-    def start(self):
-        if self._use_taskmanager:
-            self._taskmanager = TaskManager(None, self.provider.name,
-                                            self.provider.rate)
-            self._taskmanager.start()
+    def start(self, zk_conn):
         self.resetClient()
+        self._zk = zk_conn
 
     def stop(self):
-        if self._taskmanager:
-            self._taskmanager.stop()
+        pass
 
     def join(self):
-        if self._taskmanager:
-            self._taskmanager.join()
+        pass
 
+    def getRequestHandler(self, poolworker, request):
+        return handler.OpenStackNodeRequestHandler(poolworker, request)
+
+    # TODO(gtema): caching
     @property
     def _flavors(self):
         if not self.__flavors:
@@ -137,16 +78,22 @@ class OpenStackProvider(Provider):
         return self.__flavors
 
     def _getClient(self):
-        if self._use_taskmanager:
-            manager = self._taskmanager
-        else:
-            manager = None
-        return shade.OpenStackCloud(
-            cloud_config=self.provider.cloud_config,
-            manager=manager,
+        rate_limit = None
+        # nodepool tracks rate limit in time between requests.
+        # openstacksdk tracks rate limit in requests per second.
+        # 1/time = requests-per-second.
+        if self.provider.rate:
+            rate_limit = 1 / self.provider.rate
+        return openstack.connection.Connection(
+            config=self.provider.cloud_config,
+            use_direct_get=False,
+            rate_limit=rate_limit,
+            statsd_host=os.getenv('STATSD_HOST', None),
+            statsd_port=os.getenv('STATSD_PORT ', None),
+            statsd_prefix='nodepool.task.{0}'.format(self.provider.name),
             app_name='nodepool',
-            app_version=version.version_info.version_string(),
-            **self.provider.cloud_config.config)
+            app_version=version.version_info.version_string()
+        )
 
     def quotaNeededByNodeType(self, ntype, pool):
         provider_label = pool.labels[ntype]
@@ -198,32 +145,42 @@ class OpenStackProvider(Provider):
     def invalidateQuotaCache(self):
         self._current_nodepool_quota['timestamp'] = 0
 
-    def estimatedNodepoolQuotaUsed(self, zk, pool=None):
+    def estimatedNodepoolQuotaUsed(self, pool=None):
         '''
         Sums up the quota used (or planned) currently by nodepool. If pool is
         given it is filtered by the pool.
 
-        :param zk: the object to access zookeeper
         :param pool: If given, filtered by the pool.
         :return: Calculated quota in use by nodepool
         '''
         used_quota = QuotaInformation()
 
-        for node in zk.nodeIterator():
+        for node in self._zk.nodeIterator():
             if node.provider == self.provider.name:
-                if pool and not node.pool == pool.name:
-                    continue
-                provider_pool = self.provider.pools.get(node.pool)
-                if not provider_pool:
-                    self.log.warning(
-                        "Cannot find provider pool for node %s" % node)
-                    # This node is in a funny state we log it for debugging
-                    # but move on and don't account it as we can't properly
-                    # calculate its cost without pool info.
-                    continue
-                node_resources = self.quotaNeededByNodeType(
-                    node.type, provider_pool)
-                used_quota.add(node_resources)
+                try:
+                    if pool and not node.pool == pool.name:
+                        continue
+                    provider_pool = self.provider.pools.get(node.pool)
+                    if not provider_pool:
+                        self.log.warning(
+                            "Cannot find provider pool for node %s" % node)
+                        # This node is in a funny state we log it for debugging
+                        # but move on and don't account it as we can't properly
+                        # calculate its cost without pool info.
+                        continue
+                    if node.type[0] not in provider_pool.labels:
+                        self.log.warning("Node type is not in provider pool "
+                                         "for node %s" % node)
+                        # This node is also in a funny state; the config
+                        # may have changed under it.  It should settle out
+                        # eventually when it's deleted.
+                        continue
+                    node_resources = self.quotaNeededByNodeType(
+                        node.type[0], provider_pool)
+                    used_quota.add(node_resources)
+                except Exception:
+                    self.log.exception("Couldn't consider invalid node %s "
+                                       "for quota:" % node)
         return used_quota
 
     def unmanagedQuotaUsed(self):
@@ -235,15 +192,22 @@ class OpenStackProvider(Provider):
         flavors = self.listFlavorsById()
         used_quota = QuotaInformation()
 
+        node_ids = set([n.id for n in self._zk.nodeIterator()])
+
         for server in self.listNodes():
             meta = server.get('metadata', {})
 
             nodepool_provider_name = meta.get('nodepool_provider_name')
-            if nodepool_provider_name and \
-                    nodepool_provider_name == self.provider.name:
-                # This provider (regardless of the launcher) owns this server
-                # so it must not be accounted for unmanaged quota.
-                continue
+            if (nodepool_provider_name and
+                nodepool_provider_name == self.provider.name):
+                # This provider (regardless of the launcher) owns this
+                # server so it must not be accounted for unmanaged
+                # quota; unless it has leaked.
+                nodepool_node_id = meta.get('nodepool_node_id')
+                # FIXME(tobiash): Add a test case for this
+                if nodepool_node_id and nodepool_node_id in node_ids:
+                    # It has not leaked.
+                    continue
 
             flavor = flavors.get(server.flavor.id)
             used_quota.add(QuotaInformation.construct_from_flavor(flavor))
@@ -252,19 +216,15 @@ class OpenStackProvider(Provider):
 
     def resetClient(self):
         self._client = self._getClient()
-        if self._use_taskmanager:
-            self._taskmanager.setClient(self._client)
 
     def _getFlavors(self):
         flavors = self.listFlavors()
         flavors.sort(key=operator.itemgetter('ram'))
         return flavors
 
-    # TODO(mordred): These next three methods duplicate logic that is in
-    #                shade, but we can't defer to shade until we're happy
-    #                with using shade's resource caching facility. We have
-    #                not yet proven that to our satisfaction, but if/when
-    #                we do, these should be able to go away.
+    # TODO(gtema): These next three methods duplicate logic that is in
+    #              openstacksdk, caching is not enabled there by default
+    #              Remove it when caching is default
     def _findFlavorByName(self, flavor_name):
         for f in self._flavors:
             if flavor_name in (f['name'], f['id']):
@@ -282,6 +242,16 @@ class OpenStackProvider(Provider):
         # Note: this will throw an error if the provider is offline
         # but all the callers are in threads (they call in via CreateServer) so
         # the mainloop won't be affected.
+        # TODO(gtema): enable commented block when openstacksdk has caching
+        # enabled by default
+        # if min_ram:
+        #     return self._client.get_flavor_by_ram(
+        #         ram=min_ram,
+        #         include=flavor_name,
+        #         get_extra=False)
+        # else:
+        #     return self._client.get_flavor(flavor_name, get_extra=False)
+
         if min_ram:
             return self._findFlavorByRam(min_ram, flavor_name)
         else:
@@ -314,7 +284,9 @@ class OpenStackProvider(Provider):
                      az=None, key_name=None, config_drive=True,
                      nodepool_node_id=None, nodepool_node_label=None,
                      nodepool_image_name=None,
-                     networks=None, boot_from_volume=False, volume_size=50):
+                     networks=None, security_groups=None,
+                     boot_from_volume=False, volume_size=50,
+                     instance_properties=None, userdata=None):
         if not networks:
             networks = []
         if not isinstance(image, dict):
@@ -335,6 +307,10 @@ class OpenStackProvider(Provider):
             create_args['key_name'] = key_name
         if az:
             create_args['availability_zone'] = az
+        if security_groups:
+            create_args['security_groups'] = security_groups
+        if userdata:
+            create_args['userdata'] = userdata
         nics = []
         for network in networks:
             net_id = self.findNetwork(network)['id']
@@ -357,6 +333,9 @@ class OpenStackProvider(Provider):
             groups=",".join(groups_list),
             nodepool_provider_name=self.provider.name,
         )
+        # merge in any provided properties
+        if instance_properties:
+            meta = {**instance_properties, **meta}
         if nodepool_node_id:
             meta['nodepool_node_id'] = nodepool_node_id
         if nodepool_image_name:
@@ -367,16 +346,18 @@ class OpenStackProvider(Provider):
 
         try:
             return self._client.create_server(wait=False, **create_args)
-        except shade.OpenStackCloudBadRequest:
+        except openstack.exceptions.BadRequestException:
             # We've gotten a 400 error from nova - which means the request
             # was malformed. The most likely cause of that, unless something
-            # became functionally and systemically broken, is stale image
+            # became functionally and systemically broken, is stale az, image
             # or flavor cache. Log a message, invalidate the caches so that
             # next time we get new caches.
             self._images = {}
-            self.__flavors = {}
+            self.__azs = None
+            self.__flavors = {}  # TODO(gtema): caching
             self.log.info(
-                "Clearing flavor and image caches due to 400 error from nova")
+                "Clearing az, flavor and image caches due to 400 error "
+                "from nova")
             raise
 
     def getServer(self, server_id):
@@ -385,7 +366,7 @@ class OpenStackProvider(Provider):
     def getServerConsole(self, server_id):
         try:
             return self._client.get_server_console(server_id)
-        except shade.OpenStackCloudException:
+        except openstack.exceptions.OpenStackCloudException:
             return None
 
     def waitForServer(self, server, timeout=3600, auto_ip=True):
@@ -400,43 +381,6 @@ class OpenStackProvider(Provider):
             if not self.getServer(server_id):
                 return
 
-    def waitForImage(self, image_id, timeout=3600):
-        last_status = None
-        for count in iterate_timeout(
-                timeout, exceptions.ImageCreateException, "image creation"):
-            try:
-                image = self.getImage(image_id)
-            except exceptions.NotFound:
-                continue
-            except ManagerStoppedException:
-                raise
-            except Exception:
-                self.log.exception('Unable to list images while waiting for '
-                                   '%s will retry' % (image_id))
-                continue
-
-            # shade returns None when not found
-            if not image:
-                continue
-
-            status = image['status']
-            if (last_status != status):
-                self.log.debug(
-                    'Status of image in {provider} {id}: {status}'.format(
-                        provider=self.provider.name,
-                        id=image_id,
-                        status=status))
-                if status == 'ERROR' and 'fault' in image:
-                    self.log.debug(
-                        'ERROR in {provider} on {id}: {resason}'.format(
-                            provider=self.provider.name,
-                            id=image_id,
-                            resason=image['fault']['message']))
-            last_status = status
-            # Glance client returns lower case statuses - but let's be sure
-            if status.lower() in ['active', 'error']:
-                return image
-
     def createImage(self, server, image_name, meta):
         return self._client.create_image_snapshot(
             image_name, server, **meta)
@@ -447,7 +391,14 @@ class OpenStackProvider(Provider):
     def labelReady(self, label):
         if not label.cloud_image:
             return False
-        image = self.getImage(label.cloud_image.external)
+
+        # If an image ID was supplied, we'll assume it is ready since
+        # we don't currently have a way of validating that (except during
+        # server creation).
+        if label.cloud_image.image_id:
+            return True
+
+        image = self.getImage(label.cloud_image.external_name)
         if not image:
             self.log.warning(
                 "Provider %s is configured to use %s as the"
@@ -470,7 +421,7 @@ class OpenStackProvider(Provider):
         #  - v2 w/task waiting is very strange and complex - but we have to
         #              block for our v1 clouds anyway, so we might as well
         #              have the interface be the same and treat faking-out
-        #              a shade-level fake-async interface later
+        #              a openstacksdk-level fake-async interface later
         if not meta:
             meta = {}
         if image_type:
@@ -484,6 +435,21 @@ class OpenStackProvider(Provider):
             sha256=sha256,
             **meta)
         return image.id
+
+    def listPorts(self, status=None):
+        '''
+        List known ports.
+
+        :param str status: A valid port status. E.g., 'ACTIVE' or 'DOWN'.
+        '''
+        if status:
+            ports = self._client.list_ports(filters={'status': status})
+        else:
+            ports = self._client.list_ports()
+        return ports
+
+    def deletePort(self, port_id):
+        self._client.delete_port(port_id)
 
     def listImages(self):
         return self._client.list_images()
@@ -512,7 +478,111 @@ class OpenStackProvider(Provider):
         self.log.debug('Deleting server %s' % server_id)
         self.deleteServer(server_id)
 
+    def cleanupLeakedInstances(self):
+        '''
+        Delete any leaked server instances.
+
+        Remove any servers found in this provider that are not recorded in
+        the ZooKeeper data.
+        '''
+
+        deleting_nodes = {}
+
+        for node in self._zk.nodeIterator():
+            if node.state == zk.DELETING:
+                if node.provider != self.provider.name:
+                    continue
+                if node.provider not in deleting_nodes:
+                    deleting_nodes[node.provider] = []
+                deleting_nodes[node.provider].append(node.external_id)
+
+        for server in self.listNodes():
+            meta = server.get('metadata', {})
+
+            if 'nodepool_provider_name' not in meta:
+                continue
+
+            if meta['nodepool_provider_name'] != self.provider.name:
+                # Another launcher, sharing this provider but configured
+                # with a different name, owns this.
+                continue
+
+            if (self.provider.name in deleting_nodes and
+                server.id in deleting_nodes[self.provider.name]):
+                # Already deleting this node
+                continue
+
+            if not self._zk.getNode(meta['nodepool_node_id']):
+                self.log.warning(
+                    "Marking for delete leaked instance %s (%s) in %s "
+                    "(unknown node id %s)",
+                    server.name, server.id, self.provider.name,
+                    meta['nodepool_node_id']
+                )
+                # Create an artifical node to use for deleting the server.
+                node = zk.Node()
+                node.external_id = server.id
+                node.provider = self.provider.name
+                node.state = zk.DELETING
+                self._zk.storeNode(node)
+
+    def filterComputePorts(self, ports):
+        '''
+        Return a list of compute ports (or no device owner).
+
+        We are not interested in ports for routers or DHCP.
+        '''
+        ret = []
+        for p in ports:
+            if p.device_owner is None or p.device_owner.startswith("compute:"):
+                ret.append(p)
+        return ret
+
+    def cleanupLeakedPorts(self):
+        if not self._last_port_cleanup:
+            self._last_port_cleanup = time.monotonic()
+            ports = self.listPorts(status='DOWN')
+            ports = self.filterComputePorts(ports)
+            self._down_ports = set([p.id for p in ports])
+            return
+
+        # Return if not enough time has passed between cleanup
+        last_check_in_secs = int(time.monotonic() - self._last_port_cleanup)
+        if last_check_in_secs <= self._port_cleanup_interval_secs:
+            return
+
+        ports = self.listPorts(status='DOWN')
+        ports = self.filterComputePorts(ports)
+        current_set = set([p.id for p in ports])
+        remove_set = current_set & self._down_ports
+
+        removed_count = 0
+        for port_id in remove_set:
+            try:
+                self.deletePort(port_id)
+            except Exception:
+                self.log.exception("Exception deleting port %s in %s:",
+                                   port_id, self.provider.name)
+            else:
+                removed_count += 1
+                self.log.debug("Removed DOWN port %s in %s",
+                               port_id, self.provider.name)
+
+        if self._statsd and removed_count:
+            key = 'nodepool.provider.%s.downPorts' % (self.provider.name)
+            self._statsd.incr(key, removed_count)
+
+        self._last_port_cleanup = time.monotonic()
+
+        # Rely on OpenStack to tell us the down ports rather than doing our
+        # own set adjustment.
+        ports = self.listPorts(status='DOWN')
+        ports = self.filterComputePorts(ports)
+        self._down_ports = set([p.id for p in ports])
+
     def cleanupLeakedResources(self):
+        self.cleanupLeakedInstances()
+        self.cleanupLeakedPorts()
         if self.provider.clean_floating_ips:
             self._client.delete_unattached_floating_ips()
 

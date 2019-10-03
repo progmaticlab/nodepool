@@ -160,7 +160,7 @@ class NodePoolCmd(NodepoolApp):
         fields = ['id', 'provider', 'label', 'server_id',
                   'public_ipv4', 'ipv6', 'state', 'age', 'locked']
         if detail:
-            fields.extend(['hostname', 'private_ipv4', 'AZ',
+            fields.extend(['pool', 'hostname', 'private_ipv4', 'AZ',
                            'connection_port', 'launcher',
                            'allocated_to', 'hold_job',
                            'comment'])
@@ -250,8 +250,8 @@ class NodePoolCmd(NodepoolApp):
                       (node.provider, node.id))
                 return
             provider = self.pool.config.providers[node.provider]
-            manager = provider_manager.get_provider(provider, True)
-            manager.start()
+            manager = provider_manager.get_provider(provider)
+            manager.start(self.zk)
             launcher.NodeDeleter.delete(self.zk, manager, node)
             manager.stop()
         else:
@@ -373,7 +373,7 @@ class NodePoolCmd(NodepoolApp):
                                  'image-delete', 'alien-image-list',
                                  'list', 'delete',
                                  'request-list', 'info', 'erase'):
-            self.zk = zk.ZooKeeper()
+            self.zk = zk.ZooKeeper(enable_cache=False)
             self.zk.connect(list(config.zookeeper_servers.values()))
 
         self.pool.setConfig(config)

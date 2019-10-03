@@ -45,11 +45,15 @@ class DibFailedError(BuilderError):
     pass
 
 
+class QuotaException(Exception):
+    pass
+
+
 class TimeoutException(Exception):
     pass
 
 
-class SSHTimeoutException(TimeoutException):
+class ConnectionTimeoutException(TimeoutException):
     statsd_key = 'error.ssh'
 
 

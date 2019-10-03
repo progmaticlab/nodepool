@@ -16,6 +16,8 @@
 """Common utilities used in testing"""
 
 import glob
+import itertools
+import kubernetes.config.kube_config
 import logging
 import os
 import random
@@ -188,11 +190,21 @@ class BaseTestCase(testtools.TestCase):
                                              LoggingPopenFactory))
         self.setUpFakes()
 
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        # This is a hack to cleanup kubernetes temp files during test runs.
+        # The kube_config maintains a global dict of temporary files. During
+        # running the tests those can get deleted during the cleanup phase of
+        # the tests without kube_config knowing about this so forcefully tell
+        # kube_config to clean this up.
+        kubernetes.config.kube_config._cleanup_temp_files()
+
     def setUpFakes(self):
         clouds_path = os.path.join(os.path.dirname(__file__),
                                    'fixtures', 'clouds.yaml')
         self.useFixture(fixtures.MonkeyPatch(
-            'os_client_config.config.CONFIG_FILES', [clouds_path]))
+            'openstack.config.loader.CONFIG_FILES', [clouds_path]))
 
     def wait_for_threads(self):
         # Wait until all transient threads (node launches, deletions,
@@ -206,6 +218,7 @@ class BaseTestCase(testtools.TestCase):
                      'fake-provider3',
                      'CleanupWorker',
                      'DeletedNodeWorker',
+                     'StatsWorker',
                      'pydevd.CommandThread',
                      'pydevd.Reader',
                      'pydevd.Writer',
@@ -235,19 +248,63 @@ class BaseTestCase(testtools.TestCase):
             time.sleep(0.1)
 
     def assertReportedStat(self, key, value=None, kind=None):
+        """Check statsd output
+
+        Check statsd return values.  A ``value`` should specify a
+        ``kind``, however a ``kind`` may be specified without a
+        ``value`` for a generic match.  Leave both empy to just check
+        for key presence.
+
+        :arg str key: The statsd key
+        :arg str value: The expected value of the metric ``key``
+        :arg str kind: The expected type of the metric ``key``  For example
+
+          - ``c`` counter
+          - ``g`` gauge
+          - ``ms`` timing
+          - ``s`` set
+        """
+
+        if value:
+            self.assertNotEqual(kind, None)
+
         start = time.time()
         while time.time() < (start + 5):
-            for stat in self.statsd.stats:
-                k, v = stat.decode('utf8').split(':')
+            # Note our fake statsd just queues up results in a queue.
+            # We just keep going through them until we find one that
+            # matches, or fail out.  If statsd pipelines are used,
+            # large single packets are sent with stats separated by
+            # newlines; thus we first flatten the stats out into
+            # single entries.
+            stats = itertools.chain.from_iterable(
+                [s.decode('utf-8').split('\n') for s in self.statsd.stats])
+            for stat in stats:
+                k, v = stat.split(':')
                 if key == k:
-                    if value is None and kind is None:
-                        return
-                    elif value:
-                        if value == v:
-                            return
-                    elif kind:
-                        if v.endswith('|' + kind):
-                            return
+                    if kind is None:
+                        # key with no qualifiers is found
+                        return True
+
+                    s_value, s_kind = v.split('|')
+
+                    # if no kind match, look for other keys
+                    if kind != s_kind:
+                        continue
+
+                    if value:
+                        # special-case value|ms because statsd can turn
+                        # timing results into float of indeterminate
+                        # length, hence foiling string matching.
+                        if kind == 'ms':
+                            if float(value) == float(s_value):
+                                return True
+                        if value == s_value:
+                            return True
+                        # otherwise keep looking for other matches
+                        continue
+
+                    # this key matches
+                    return True
             time.sleep(0.1)
 
         raise Exception("Key %s not found in reported stats" % key)
@@ -282,24 +339,28 @@ class DBTestCase(BaseTestCase):
         self.log = logging.getLogger("tests")
         self.setupZK()
 
-    def setup_config(self, filename, images_dir=None):
+    def setup_config(self, filename, images_dir=None, context_name=None):
         if images_dir is None:
             images_dir = fixtures.TempDir()
             self.useFixture(images_dir)
         build_log_dir = fixtures.TempDir()
         self.useFixture(build_log_dir)
-        configfile = os.path.join(os.path.dirname(__file__),
-                                  'fixtures', filename)
-        (fd, path) = tempfile.mkstemp()
-        with open(configfile, 'rb') as conf_fd:
-            config = conf_fd.read().decode('utf8')
-            data = config.format(images_dir=images_dir.path,
-                                 build_log_dir=build_log_dir.path,
-                                 zookeeper_host=self.zookeeper_host,
-                                 zookeeper_port=self.zookeeper_port,
-                                 zookeeper_chroot=self.zookeeper_chroot)
-            os.write(fd, data.encode('utf8'))
-        os.close(fd)
+        if filename.startswith('/'):
+            path = filename
+        else:
+            configfile = os.path.join(os.path.dirname(__file__),
+                                      'fixtures', filename)
+            (fd, path) = tempfile.mkstemp()
+            with open(configfile, 'rb') as conf_fd:
+                config = conf_fd.read().decode('utf8')
+                data = config.format(images_dir=images_dir.path,
+                                     build_log_dir=build_log_dir.path,
+                                     context_name=context_name,
+                                     zookeeper_host=self.zookeeper_host,
+                                     zookeeper_port=self.zookeeper_port,
+                                     zookeeper_chroot=self.zookeeper_chroot)
+                os.write(fd, data.encode('utf8'))
+            os.close(fd)
         self._config_images_dir = images_dir
         self._config_build_log_dir = build_log_dir
         validator = ConfigValidator(path)
@@ -364,20 +425,25 @@ class DBTestCase(BaseTestCase):
             time.sleep(1)
         self.wait_for_threads()
 
-    def waitForBuild(self, image_name, build_id):
+    def waitForBuild(self, image_name, build_id, states=None):
+        if states is None:
+            states = (zk.READY,)
+
         base = "-".join([image_name, build_id])
-        while True:
-            self.wait_for_threads()
-            files = builder.DibImageFile.from_image_id(
-                self._config_images_dir.path, base)
-            if files:
-                break
-            time.sleep(1)
 
         while True:
             self.wait_for_threads()
             build = self.zk.getBuild(image_name, build_id)
-            if build and build.state == zk.READY:
+            if build and build.state in states:
+                break
+            time.sleep(1)
+
+        # We should only expect a dib manifest with a successful build.
+        while build.state == zk.READY:
+            self.wait_for_threads()
+            files = builder.DibImageFile.from_image_id(
+                self._config_images_dir.path, base)
+            if files:
                 break
             time.sleep(1)
 
@@ -480,9 +546,10 @@ class DBTestCase(BaseTestCase):
         return app
 
     def useBuilder(self, configfile, securefile=None, cleanup_interval=.5):
-        self.useFixture(
+        builder_fixture = self.useFixture(
             BuilderFixture(configfile, cleanup_interval, securefile)
         )
+        return builder_fixture.builder
 
     def setupZK(self):
         f = ZookeeperServerFixture()
@@ -494,7 +561,7 @@ class DBTestCase(BaseTestCase):
             self.zookeeper_host,
             self.zookeeper_port))
         self.zookeeper_chroot = kz_fxtr.zookeeper_chroot
-        self.zk = zk.ZooKeeper()
+        self.zk = zk.ZooKeeper(enable_cache=False)
         host = zk.ZooKeeperConnectionConfig(
             self.zookeeper_host, self.zookeeper_port, self.zookeeper_chroot
         )

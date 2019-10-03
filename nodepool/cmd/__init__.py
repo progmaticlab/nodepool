@@ -18,6 +18,7 @@ import argparse
 import daemon
 import errno
 import extras
+import io
 import logging
 import logging.config
 import os
@@ -28,6 +29,9 @@ import traceback
 
 from nodepool.version import version_info as npd_version_info
 from nodepool import logconfig
+
+yappi = extras.try_import('yappi')
+objgraph = extras.try_import('objgraph')
 
 # as of python-daemon 1.6 it doesn't bundle pidlockfile anymore
 # instead it depends on lockfile-0.9.1 which uses pidfile.
@@ -58,21 +62,57 @@ def is_pidfile_stale(pidfile):
 
 def stack_dump_handler(signum, frame):
     signal.signal(signal.SIGUSR2, signal.SIG_IGN)
-    log_str = ""
-    threads = {}
-    for t in threading.enumerate():
-        threads[t.ident] = t
-    for thread_id, stack_frame in sys._current_frames().items():
-        thread = threads.get(thread_id)
-        if thread:
-            thread_name = thread.name
-        else:
-            thread_name = 'Unknown'
-        label = '%s (%s)' % (thread_name, thread_id)
-        log_str += "Thread: %s\n" % label
-        log_str += "".join(traceback.format_stack(stack_frame))
     log = logging.getLogger("nodepool.stack_dump")
-    log.debug(log_str)
+    log.debug("Beginning debug handler")
+
+    try:
+        threads = {}
+        for t in threading.enumerate():
+            threads[t.ident] = t
+        log_str = ""
+        for thread_id, stack_frame in sys._current_frames().items():
+            thread = threads.get(thread_id)
+            if thread:
+                thread_name = thread.name
+                thread_is_daemon = str(thread.daemon)
+            else:
+                thread_name = '(Unknown)'
+                thread_is_daemon = '(Unknown)'
+            log_str += "Thread: %s %s d: %s\n"\
+                       % (thread_id, thread_name, thread_is_daemon)
+            log_str += "".join(traceback.format_stack(stack_frame))
+        log.debug(log_str)
+    except Exception:
+        log.exception("Thread dump error:")
+
+    try:
+        if yappi:
+            if not yappi.is_running():
+                log.debug("Starting Yappi")
+                yappi.start()
+            else:
+                log.debug("Stopping Yappi")
+                yappi.stop()
+                yappi_out = io.StringIO()
+                yappi.get_func_stats().print_all(out=yappi_out)
+                yappi.get_thread_stats().print_all(out=yappi_out)
+                log.debug(yappi_out.getvalue())
+                yappi_out.close()
+                yappi.clear_stats()
+    except Exception:
+        log.exception("Yappi error:")
+
+    try:
+        if objgraph:
+            log.debug("Most common types:")
+            objgraph_out = io.StringIO()
+            objgraph.show_growth(limit=100, file=objgraph_out)
+            log.debug(objgraph_out.getvalue())
+            objgraph_out.close()
+    except Exception:
+        log.exception("Objgraph error:")
+    log.debug("End debug handler")
+
     signal.signal(signal.SIGUSR2, stack_dump_handler)
 
 
@@ -90,23 +130,35 @@ class NodepoolApp(object):
             return None
         return os.path.abspath(os.path.expanduser(path))
 
+    def _get_version(self):
+        return "Nodepool version: %s" % npd_version_info.release_string()
+
     def create_parser(self):
-        parser = argparse.ArgumentParser(description=self.app_description)
+        parser = argparse.ArgumentParser(
+            description=self.app_description,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
         parser.add_argument('-l',
                             dest='logconfig',
                             help='path to log config file')
 
-        parser.add_argument('--version',
-                            action='version',
-                            version=npd_version_info.version_string())
+        parser.add_argument('--version', dest='version', action='version',
+                            version=self._get_version(),
+                            help='show nodepool version')
 
         return parser
 
     def parse_args(self):
-        args = self.parser.parse_args()
-        self.logconfig = self.get_path(args.logconfig)
-        return args
+        self.args = self.parser.parse_args()
+        self.logconfig = self.get_path(self.args.logconfig)
+
+        # The arguments debug and foreground both lead to nodaemon mode so
+        # set nodaemon if one of them is set.
+        if ((hasattr(self.args, 'debug') and self.args.debug) or
+                (hasattr(self.args, 'foreground') and self.args.foreground)):
+            self.args.nodaemon = True
+        else:
+            self.args.nodaemon = False
 
     def setup_logging(self):
         if self.logconfig:
@@ -116,7 +168,8 @@ class NodepoolApp(object):
             # config, leave the config set to emit to stdout.
             if hasattr(self.args, 'nodaemon') and self.args.nodaemon:
                 logging_config = logconfig.ServerLoggingConfig()
-                logging_config.setDebug()
+                if hasattr(self.args, 'debug') and self.args.debug:
+                    logging_config.setDebug()
             else:
                 # Setting a server value updates the defaults to use
                 # WatchedFileHandler on /var/log/nodepool/{server}-debug.log
@@ -130,7 +183,7 @@ class NodepoolApp(object):
             argv = sys.argv[1:]
 
         self.parser = self.create_parser()
-        self.args = self.parse_args()
+        self.parse_args()
         return self._do_run()
 
     def _do_run(self):
@@ -159,16 +212,19 @@ class NodepoolDaemonApp(NodepoolApp):
                             default='/var/run/nodepool/%s.pid' % self.app_name)
 
         parser.add_argument('-d',
-                            dest='nodaemon',
+                            dest='debug',
+                            action='store_true',
+                            help='do not run as a daemon with debug logging')
+        parser.add_argument('-f',
+                            dest='foreground',
                             action='store_true',
                             help='do not run as a daemon')
 
         return parser
 
     def parse_args(self):
-        args = super(NodepoolDaemonApp, self).parse_args()
-        self.pidfile = self.get_path(args.pidfile)
-        return args
+        super().parse_args()
+        self.pidfile = self.get_path(self.args.pidfile)
 
     def _do_run(self):
         if self.args.nodaemon:

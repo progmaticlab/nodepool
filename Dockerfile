@@ -42,7 +42,7 @@ CMD ["/usr/local/bin/nodepool-launcher", "-f"]
 FROM nodepool as nodepool-builder
 USER 0
 RUN apt-get update \
-  && apt-get install -y procps sudo curl qemu-utils gdisk kpartx \
+  && apt-get install -y procps sudo curl qemu-utils gdisk kpartx xz \
   && mkdir /opt/dib_tmp
 USER 10001
 CMD ["/usr/local/bin/nodepool-builder", "-f"]

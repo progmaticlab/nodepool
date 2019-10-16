@@ -138,22 +138,24 @@ class AwsProvider(Provider):
             KeyName=label.key_name,
             InstanceType=label.instance_type)
 
-        if label.pool.security_group_id:
-            args['NetworkInterfaces'][0]['Groups'] = [
-                label.pool.security_group_id
-            ]
         if label.pool.subnet_id and not label.pool.subnets:
             args['NetworkInterfaces'] = [{
                 'SubnetId': label.pool.subnet_id,
-                'AssociatePublicIpAddress': True,
+                'DeleteOnTermination': True,
                 'DeviceIndex': 0}]
+            if label.pool.security_group_id:
+                args['NetworkInterfaces'][0]['Groups'] = [
+                    label.pool.security_group_id]
         elif label.pool.subnets:
             args['NetworkInterfaces'] = list()
             for i in range(len(label.pool.subnets)):
                 args['NetworkInterfaces'].append({
                     'SubnetId': label.pool.subnets[i],
-                    'AssociatePublicIpAddress': i == 0,
+                    'DeleteOnTermination': True,
                     'DeviceIndex': i})
+                if label.pool.security_group_id:
+                    args['NetworkInterfaces'][i]['Groups'] = [
+                        label.pool.security_group_id]
 
         # Default block device mapping parameters are embedded in AMIs.
         # We might need to supply our own mapping before lauching the instance.
@@ -179,3 +181,12 @@ class AwsProvider(Provider):
 
         instances = self.ec2.create_instances(**args)
         return self.ec2.Instance(instances[0].id)
+
+    def addFloatingIP(self, instance):
+        allocation = self.ec2.allocate_address(Domain='vpc')
+        response = self.ec2.associate_address(AllocationId=allocation['AllocationId'],
+                                              InstanceId=instance.id)
+
+        # TODO:
+
+        instance.reload()

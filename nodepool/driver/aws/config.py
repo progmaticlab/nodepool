@@ -83,6 +83,7 @@ class ProviderPool(ConfigPool):
         self.subnet_id = None
         self.subnets = None
         self.security_group_id = None
+        self.auto_floating_ip = True
         self.host_key_checking = True
         self.labels = None
         # The ProviderConfig object that owns this pool.
@@ -97,6 +98,7 @@ class ProviderPool(ConfigPool):
         self.provider = provider
 
         self.security_group_id = pool_config.get('security-group-id')
+        self.auto_floating_ip = pool_config.get('auto-floating-ip')
         self.subnet_id = pool_config.get('subnet-id')
         self.subnets = pool_config.get('subnets')
         self.host_key_checking = bool(
@@ -135,6 +137,7 @@ class ProviderPool(ConfigPool):
                     and other.subnet_id == self.subnet_id
                     and other.subnets == self.subnets
                     and other.security_group_id == self.security_group_id
+                    and other.auto_floating_ip == self.auto_floating_ip
                     and other.host_key_checking == self.host_key_checking
                     and other.labels == self.labels)
         return False
@@ -223,7 +226,9 @@ class AwsProviderConfig(ProviderConfig):
             v.Required('name'): str,
             v.Required('labels'): [pool_label],
             'security-group-id': str,
+            'auto-floating-ip': bool,
             'subnet-id': str,
+            'subnets': [str],
         })
 
         provider_cloud_images = {

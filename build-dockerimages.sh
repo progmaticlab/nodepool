@@ -3,7 +3,7 @@
 # $1 - name of component to build. all components will be built if not present
 
 NODEPOOL_DOCKERREPO=${NODEPOOL_DOCKERREPO:-"local"}
-NODEPOOL_VERSION=${NODEPOOL_VERSION:-"0.5.1"}
+NODEPOOL_VERSION=${NODEPOOL_VERSION:-"3.8.0-1"}
 
 function build() {
   local name=$1

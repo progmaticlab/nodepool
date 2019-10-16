@@ -81,6 +81,7 @@ class ProviderPool(ConfigPool):
         self.max_cores = None
         self.max_ram = None
         self.subnet_id = None
+        self.subnets = None
         self.security_group_id = None
         self.host_key_checking = True
         self.labels = None
@@ -97,6 +98,7 @@ class ProviderPool(ConfigPool):
 
         self.security_group_id = pool_config.get('security-group-id')
         self.subnet_id = pool_config.get('subnet-id')
+        self.subnets = pool_config.get('subnets')
         self.host_key_checking = bool(
             pool_config.get('host-key-checking', True))
 
@@ -127,9 +129,11 @@ class ProviderPool(ConfigPool):
         if isinstance(other, ProviderPool):
             # NOTE(Shrews): We intentionally do not compare 'provider' here
             # since this causes recursive checks with OpenStackProviderConfig.
+            # NOTE(andrey-mp): subnets must be compared in order that was in config
             return (super().__eq__(other)
                     and other.name == self.name
                     and other.subnet_id == self.subnet_id
+                    and other.subnets == self.subnets
                     and other.security_group_id == self.security_group_id
                     and other.host_key_checking == self.host_key_checking
                     and other.labels == self.labels)

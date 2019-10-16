@@ -136,17 +136,24 @@ class AwsProvider(Provider):
             MinCount=1,
             MaxCount=1,
             KeyName=label.key_name,
-            InstanceType=label.instance_type,
-            NetworkInterfaces=[{
-                'AssociatePublicIpAddress': True,
-                'DeviceIndex': 0}])
+            InstanceType=label.instance_type)
 
         if label.pool.security_group_id:
             args['NetworkInterfaces'][0]['Groups'] = [
                 label.pool.security_group_id
             ]
-        if label.pool.subnet_id:
-            args['NetworkInterfaces'][0]['SubnetId'] = label.pool.subnet_id
+        if label.pool.subnet_id and not label.pool.subnets:
+            args['NetworkInterfaces'] = [{
+                'SubnetId': label.pool.subnet_id,
+                'AssociatePublicIpAddress': True,
+                'DeviceIndex': 0}]
+        elif label.pool.subnets:
+            args['NetworkInterfaces'] = list()
+            for i in range(len(label.pool.subnets)):
+                args['NetworkInterfaces'].append({
+                    'SubnetId': label.pool.subnets[i],
+                    'AssociatePublicIpAddress': i == 0,
+                    'DeviceIndex': i})
 
         # Default block device mapping parameters are embedded in AMIs.
         # We might need to supply our own mapping before lauching the instance.

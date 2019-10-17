@@ -73,16 +73,10 @@ class AwsInstanceLauncher(NodeLauncher):
             raise exceptions.LaunchStatusException(
                 "Instance %s failed to start: %s" % (instance_id, state))
 
-        self.log.debug("GGG: instance {}".format(instance))
-
-        if self.label.auto_floating_ip:
-            self.handler.manager.addFloatingIP(instance)
-            server_ip = instance.public_ip_address
-            if not server_ip:
-                raise exceptions.LaunchStatusException(
-                    "Instance %s doesn't have a public ip" % instance_id)
-        else:
-            server_ip = instance.private_ip_address
+        server_ip = instance.public_ip_address
+        if not server_ip:
+            raise exceptions.LaunchStatusException(
+                "Instance %s doesn't have a public ip" % instance_id)
 
         self.node.connection_port = self.label.cloud_image.connection_port
         self.node.connection_type = self.label.cloud_image.connection_type

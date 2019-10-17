@@ -136,26 +136,19 @@ class AwsProvider(Provider):
             MinCount=1,
             MaxCount=1,
             KeyName=label.key_name,
-            InstanceType=label.instance_type)
+            InstanceType=label.instance_type,
+            NetworkInterfaces=[{
+                'AssociatePublicIpAddress': True,
+                'DeviceIndex': 0}])
 
+        if label.pool.security_group_id:
+            args['NetworkInterfaces'][0]['Groups'] = [
+                label.pool.security_group_id
+            ]
         if label.pool.subnet_id and not label.pool.subnets:
-            args['NetworkInterfaces'] = [{
-                'SubnetId': label.pool.subnet_id,
-                'DeleteOnTermination': True,
-                'DeviceIndex': 0}]
-            if label.pool.security_group_id:
-                args['NetworkInterfaces'][0]['Groups'] = [
-                    label.pool.security_group_id]
+            args['NetworkInterfaces'][0]['SubnetId'] = label.pool.subnet_id
         elif label.pool.subnets:
-            args['NetworkInterfaces'] = list()
-            for i in range(len(label.pool.subnets)):
-                args['NetworkInterfaces'].append({
-                    'SubnetId': label.pool.subnets[i],
-                    'DeleteOnTermination': True,
-                    'DeviceIndex': i})
-                if label.pool.security_group_id:
-                    args['NetworkInterfaces'][i]['Groups'] = [
-                        label.pool.security_group_id]
+            args['NetworkInterfaces'][0]['SubnetId'] = label.pool.subnets[0]
 
         # Default block device mapping parameters are embedded in AMIs.
         # We might need to supply our own mapping before lauching the instance.
@@ -180,13 +173,35 @@ class AwsProvider(Provider):
                 args['BlockDeviceMappings'] = [mapping]
 
         instances = self.ec2.create_instances(**args)
-        return self.ec2.Instance(instances[0].id)
+        instance_id = instances[0].id
+        instance = self.ec2.Instance(instance_id)
+        if label.pool.subnets and len(label.pool.subnets) > 1:
+            groups = list()
+        if label.pool.security_group_id:
+            client = aws.client('ec2')
+            index = 1
+            groups.append(label.pool.security_group_id)
+            waiter = client.get_waiter('network_interface_available')
+            for subnet_id in label.pool.subnets[1:]:
+                attachment_id = None
+                ni = ec2.create_network_interface(
+                    Groups=groups,
+                    SubnetId=subnet_id)
+                try:
+                    waiter.wait(NetworkInterfaceIds=[ni.network_interface_id])
+                    res = ni.attach(DeviceIndex=index, InstanceId=instance_id)
+                    attachment_id = res['AttachmentId']
+                    ni.modify_attribute(
+                        Attachment={
+                            'AttachmentId': attachment_id,
+                            'DeleteOnTermination': True
+                        }
+                    )
+                except Exception:
+                    if attachment_id:
+                        ni.detach(Force=True)
+                    ni.delete()
+                    raise
+                index += 1                    
 
-    def addFloatingIP(self, instance):
-        allocation = self.ec2.allocate_address(Domain='vpc')
-        response = self.ec2.associate_address(AllocationId=allocation['AllocationId'],
-                                              InstanceId=instance.id)
-
-        # TODO:
-
-        instance.reload()
+        return instance

@@ -175,16 +175,17 @@ class AwsProvider(Provider):
         instances = self.ec2.create_instances(**args)
         instance_id = instances[0].id
         instance = self.ec2.Instance(instance_id)
+        instance.wait_until_running()
         if label.pool.subnets and len(label.pool.subnets) > 1:
             groups = list()
         if label.pool.security_group_id:
-            client = aws.client('ec2')
+            client = self.aws.client('ec2')
             index = 1
             groups.append(label.pool.security_group_id)
             waiter = client.get_waiter('network_interface_available')
             for subnet_id in label.pool.subnets[1:]:
                 attachment_id = None
-                ni = ec2.create_network_interface(
+                ni = self.ec2.create_network_interface(
                     Groups=groups,
                     SubnetId=subnet_id)
                 try:
